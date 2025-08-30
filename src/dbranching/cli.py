@@ -8,7 +8,7 @@ from typing import Optional
 import click
 
 from .config import Config, ConfigManager
-from .exceptions import DBranchingError
+from .exceptions import DBranchingError, ConfigurationError, DatabaseConnectionError, StorageError
 
 # Global configuration manager instance
 config_manager: Optional[ConfigManager] = None
@@ -907,6 +907,510 @@ def status(ctx: click.Context, verbose: bool) -> None:
 
     except Exception as e:
         handle_error(e, global_verbose)
+
+
+@main.group()
+@click.pass_context
+def hook(ctx: click.Context) -> None:
+    """Manage Git hook integration for automatic database snapshots.
+
+    Git hooks enable automatic snapshot creation during Git operations like branch
+    switches and merges. This provides seamless workflow integration without manual
+    snapshot management.
+
+    \b
+    HOOK TYPES:
+      post-checkout    # Triggers on branch switches and new branch creation
+      post-merge       # Triggers on merge operations and conflict resolution
+
+    \b
+    INTEGRATION FEATURES:
+      • Automatic snapshot creation on configured branch operations
+      • Non-disruptive: Git operations never fail due to hook errors
+      • Hook chaining: Preserves existing hooks through wrapper pattern
+      • Safe installation/uninstallation with automatic backups
+      • Performance optimized to minimize Git workflow impact
+
+    \b
+    COMMON COMMANDS:
+      dbranching hook install                   # Install hooks with auto-detection
+      dbranching hook status                    # Check hook installation status
+      dbranching hook uninstall                 # Remove hooks and restore originals
+      dbranching hook test                      # Test hook integration
+
+    \b
+    CONFIGURATION:
+      Configure hook behavior in dbranching.yaml:
+      • git.hooks.enabled: Enable/disable hook integration
+      • git.hooks.auto_install: Install hooks automatically during init
+      • git.branches.auto_snapshot: Branch patterns that trigger snapshots
+      • git.branches.ignore: Branch patterns to ignore
+
+    Use 'dbranching hook COMMAND --help' for detailed help on each command.
+    """
+    pass
+
+
+@hook.command("install")
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Force installation even if hooks already exist",
+)
+@click.pass_context
+def hook_install(ctx: click.Context, force: bool) -> None:
+    """Install Git hooks for automatic database snapshots.
+
+    Installs post-checkout and post-merge hooks that automatically create database
+    snapshots during Git operations. Existing hooks are preserved through a wrapper
+    pattern that chains the original hook with dbranching functionality.
+
+    \b
+    WHAT THIS DOES:
+      • Backs up existing hooks to .dbranching-original files  
+      • Installs wrapper hooks that chain original + dbranching functionality
+      • Sets proper executable permissions and validates installation
+      • Tests hook integration without triggering operations
+
+    \b
+    SAFETY FEATURES:
+      • Atomic installation: All hooks installed or none (rollback on failure)
+      • Automatic backups: Original hooks preserved and restorable
+      • Non-destructive: Original hooks executed first, then dbranching
+      • Validation: Hooks tested before activation
+
+    \b
+    EXAMPLES:
+      dbranching hook install                   # Install hooks with validation
+      dbranching hook install --force           # Force reinstall existing hooks
+
+    \b
+    AFTER INSTALLATION:
+      • Git operations on configured branches will create snapshots automatically
+      • Check status: dbranching hook status
+      • Test integration: dbranching hook test
+      • View logs: Check configured log directory for hook execution details
+
+    Hook installation requires write access to .git/hooks/ directory.
+    """
+    verbose = ctx.obj["verbose"]
+    dry_run = ctx.obj["dry_run"]
+
+    try:
+        if dry_run:
+            click.echo("Would install Git hooks:")
+            click.echo("  • post-checkout hook for branch operations")
+            click.echo("  • post-merge hook for merge operations")
+            return
+
+        config_obj = ctx.obj["config"]
+
+        # Check if hooks are enabled
+        if not config_obj.git.hooks.get("enabled", True):
+            click.echo("Git hooks are disabled in configuration")
+            click.echo("Enable with: dbranching config set git.hooks.enabled true")
+            return
+
+        # Import here to avoid circular imports
+        from .git import GitHookManager
+
+        # Initialize hook manager
+        hook_manager = GitHookManager(config_obj)
+
+        # Install hooks
+        import asyncio
+        results = asyncio.run(hook_manager.install_hooks(force))
+
+        # Report results
+        successful = sum(1 for success in results.values() if success)
+        total = len(results)
+
+        if successful == total:
+            click.echo(f"✓ Successfully installed {successful} Git hooks")
+            if verbose:
+                for hook_name, success in results.items():
+                    status = "✓ installed" if success else "⚠ skipped"
+                    click.echo(f"  {hook_name}: {status}")
+        else:
+            click.echo(f"⚠ Partially installed: {successful}/{total} hooks")
+            for hook_name, success in results.items():
+                status = "✓ installed" if success else "✗ failed"
+                click.echo(f"  {hook_name}: {status}")
+
+    except Exception as e:
+        handle_error(e, verbose)
+
+
+@hook.command("uninstall") 
+@click.option(
+    "--confirm",
+    is_flag=True,
+    help="Confirm uninstallation without prompting",
+)
+@click.pass_context
+def hook_uninstall(ctx: click.Context, confirm: bool) -> None:
+    """Uninstall Git hooks and restore original hooks.
+
+    Removes dbranching Git hooks and restores any original hooks that were
+    backed up during installation. This safely reverts the repository to
+    its pre-dbranching hook state.
+
+    \b
+    WHAT THIS DOES:
+      • Removes dbranching hook wrapper scripts
+      • Restores original hooks from .dbranching-original backups
+      • Validates successful restoration
+      • Cleans up backup files
+
+    \b
+    SAFETY FEATURES:
+      • Preserves original hook functionality
+      • No data loss: Only removes dbranching-specific hooks
+      • Validation: Ensures original hooks are properly restored
+
+    \b
+    EXAMPLES:
+      dbranching hook uninstall                 # Uninstall with confirmation prompt
+      dbranching hook uninstall --confirm       # Uninstall without prompting
+
+    This operation is safe and can be reversed by reinstalling hooks.
+    """
+    verbose = ctx.obj["verbose"]
+    dry_run = ctx.obj["dry_run"]
+
+    try:
+        if not confirm and not dry_run:
+            if not click.confirm("Uninstall Git hooks and restore originals?"):
+                click.echo("Uninstall cancelled")
+                return
+
+        if dry_run:
+            click.echo("Would uninstall Git hooks:")
+            click.echo("  • Remove post-checkout hook")
+            click.echo("  • Remove post-merge hook") 
+            click.echo("  • Restore original hooks if present")
+            return
+
+        config_obj = ctx.obj["config"]
+
+        # Import here to avoid circular imports
+        from .git import GitHookManager
+
+        # Initialize hook manager
+        hook_manager = GitHookManager(config_obj)
+
+        # Uninstall hooks
+        import asyncio
+        results = asyncio.run(hook_manager.uninstall_hooks())
+
+        # Report results
+        successful = sum(1 for success in results.values() if success)
+        total = len(results)
+
+        if successful == total:
+            click.echo(f"✓ Successfully uninstalled {successful} Git hooks")
+            if verbose:
+                for hook_name, success in results.items():
+                    status = "✓ uninstalled" if success else "⚠ not installed"
+                    click.echo(f"  {hook_name}: {status}")
+        else:
+            click.echo(f"⚠ Partially uninstalled: {successful}/{total} hooks")
+            for hook_name, success in results.items():
+                status = "✓ uninstalled" if success else "✗ failed"
+                click.echo(f"  {hook_name}: {status}")
+
+    except Exception as e:
+        handle_error(e, verbose)
+
+
+@hook.command("status")
+@click.option(
+    "--verbose",
+    "-v",
+    is_flag=True,
+    help="Show detailed status including file sizes and timestamps",
+)
+@click.pass_context
+def hook_status(ctx: click.Context, verbose_flag: bool) -> None:
+    """Display Git hook installation and configuration status.
+
+    Shows the current state of dbranching Git hooks including installation status,
+    configuration settings, and repository information. Use this to verify hook
+    installation and troubleshoot integration issues.
+
+    \b
+    BASIC STATUS:
+      • Hook installation status (installed/not installed)
+      • Hook type verification (dbranching/original/other)
+      • Configuration settings (enabled/disabled, branch patterns)
+      • Repository information (current branch, clean/dirty state)
+
+    \b
+    VERBOSE STATUS ADDS:
+      • Hook file details (size, modification time, permissions)
+      • Full configuration dump for Git integration settings
+      • Repository details (remote URL, commit hash)
+      • Backup status and restoration capability
+
+    \b
+    EXAMPLES:
+      dbranching hook status                    # Basic status overview
+      dbranching hook status --verbose          # Detailed status information
+      dbranching hook status -v                 # Same as --verbose
+
+    This command never modifies the repository and is safe to run at any time.
+    """
+    global_verbose = ctx.obj["verbose"]
+    show_verbose = verbose_flag or global_verbose
+
+    try:
+        config_obj = ctx.obj["config"]
+
+        # Import here to avoid circular imports
+        from .git import GitHookManager
+
+        # Initialize hook manager  
+        hook_manager = GitHookManager(config_obj)
+
+        # Get hook status
+        status = hook_manager.get_hook_status()
+
+        # Display status
+        click.echo("Git Hook Status")
+        click.echo("=" * 50)
+
+        # Configuration status
+        hooks_enabled = config_obj.git.hooks.get("enabled", True)
+        click.echo(f"Configuration: {'✓ enabled' if hooks_enabled else '✗ disabled'}")
+
+        if not hooks_enabled:
+            click.echo("  Git hooks are disabled in configuration")
+            return
+
+        # Hook installation status
+        installed_count = sum(1 for info in status.values() if info["installed"] and info["is_dbranching_hook"])
+        total_hooks = len(status)
+
+        click.echo(f"Hook installation: {installed_count}/{total_hooks} hooks installed")
+
+        for hook_name, info in status.items():
+            if info["installed"] and info["is_dbranching_hook"]:
+                status_icon = "✓"
+                status_text = "installed"
+            elif info["installed"]:
+                status_icon = "⚠"
+                status_text = "other hook present"
+            else:
+                status_icon = "✗"
+                status_text = "not installed"
+
+            click.echo(f"  {hook_name}: {status_icon} {status_text}")
+
+            if show_verbose and info["installed"]:
+                click.echo(f"    Path: {info['path']}")
+                click.echo(f"    Size: {info['size']} bytes")
+                click.echo(f"    Executable: {'yes' if info['executable'] else 'no'}")
+                click.echo(f"    Has backup: {'yes' if info['has_original_backup'] else 'no'}")
+
+        # Configuration details
+        if show_verbose:
+            click.echo("\nConfiguration Details:")
+            auto_branches = config_obj.git.branches.get("auto_snapshot", [])
+            ignore_patterns = config_obj.git.branches.get("ignore", [])
+            
+            click.echo(f"  Auto-snapshot branches: {', '.join(auto_branches) if auto_branches else 'none'}")
+            click.echo(f"  Ignore patterns: {', '.join(ignore_patterns) if ignore_patterns else 'none'}")
+
+        # Repository information
+        try:
+            repo_info = hook_manager.branch_detector.get_repository_info()
+            click.echo(f"\nRepository: {repo_info['repo_path']}")
+            click.echo(f"  Current branch: {repo_info['current_branch'] or 'detached HEAD'}")
+            
+            if show_verbose:
+                click.echo(f"  Current commit: {repo_info['current_commit'][:8] if repo_info['current_commit'] else 'none'}")
+                click.echo(f"  Working directory: {'dirty' if repo_info['is_dirty'] else 'clean'}")
+                if repo_info['remote_url']:
+                    click.echo(f"  Remote URL: {repo_info['remote_url']}")
+
+        except Exception as e:
+            click.echo(f"  Repository info unavailable: {e}")
+
+    except Exception as e:
+        handle_error(e, global_verbose)
+
+
+@hook.command("test")
+@click.pass_context
+def hook_test(ctx: click.Context) -> None:
+    """Test Git hook integration without triggering operations.
+
+    Validates Git hook installation and integration with the snapshot engine
+    without actually creating snapshots or modifying the repository. Use this
+    to verify that hooks are properly installed and configured.
+
+    \b
+    WHAT THIS TESTS:
+      • Hook installation and executable permissions
+      • Repository access and branch detection capability
+      • Snapshot engine initialization and configuration
+      • Configuration validation for Git integration
+      • File system access for hook logging
+
+    \b
+    TEST RESULTS:
+      ✓ Pass: Component is working correctly
+      ✗ Fail: Component has issues that need attention
+      ⚠ Warn: Component works but has non-critical issues
+
+    \b
+    EXAMPLES:
+      dbranching hook test                      # Run all integration tests
+
+    This command is safe and never modifies the repository or creates snapshots.
+    Use it after installation to verify everything is working correctly.
+    """
+    verbose = ctx.obj["verbose"]
+
+    try:
+        config_obj = ctx.obj["config"]
+
+        # Import here to avoid circular imports
+        from .git import GitHookManager
+
+        # Initialize hook manager
+        hook_manager = GitHookManager(config_obj)
+
+        # Run integration tests
+        import asyncio
+        test_results = asyncio.run(hook_manager.test_hook_integration())
+
+        # Display results
+        click.echo("Git Hook Integration Test")
+        click.echo("=" * 50)
+
+        # Hook status
+        hook_status = test_results["hook_status"]
+        installed_hooks = sum(1 for info in hook_status.values() 
+                            if info["installed"] and info["is_dbranching_hook"])
+        
+        if installed_hooks > 0:
+            click.echo(f"✓ Hooks installed: {installed_hooks} hooks active")
+        else:
+            click.echo("⚠ Hooks not installed: No active dbranching hooks")
+
+        # Test results
+        tests = test_results["tests"]
+        
+        if tests.get("repository_access"):
+            click.echo("✓ Repository access: Working correctly")
+        else:
+            click.echo(f"✗ Repository access: {tests.get('repository_error', 'Failed')}")
+
+        if tests.get("snapshot_engine"):
+            click.echo("✓ Snapshot engine: Initialization successful")
+        else:
+            click.echo(f"✗ Snapshot engine: {tests.get('snapshot_error', 'Failed')}")
+
+        # Configuration
+        config_info = test_results["configuration"]
+        if config_info["hooks_enabled"]:
+            click.echo("✓ Configuration: Hooks enabled")
+        else:
+            click.echo("⚠ Configuration: Hooks disabled")
+
+        # Branch patterns
+        auto_branches = config_info["auto_snapshot_branches"]
+        if auto_branches:
+            click.echo(f"✓ Auto-snapshot branches: {', '.join(auto_branches)}")
+        else:
+            click.echo("⚠ Auto-snapshot branches: No patterns configured")
+
+        if verbose:
+            # Repository details
+            repo_info = test_results.get("repository_info", {})
+            if repo_info:
+                click.echo(f"\nRepository Details:")
+                click.echo(f"  Path: {repo_info.get('repo_path', 'Unknown')}")
+                click.echo(f"  Branch: {repo_info.get('current_branch', 'Unknown')}")
+                click.echo(f"  Clean: {not repo_info.get('is_dirty', True)}")
+
+    except Exception as e:
+        handle_error(e, verbose)
+
+
+@hook.command("post-checkout")
+@click.argument("previous_ref")
+@click.argument("current_ref") 
+@click.argument("branch_flag")
+@click.pass_context
+def hook_post_checkout(ctx: click.Context, previous_ref: str, current_ref: str, branch_flag: str) -> None:
+    """Handle post-checkout hook execution (called by Git).
+    
+    This command is called automatically by Git during checkout operations.
+    It should not be run manually unless testing hook functionality.
+
+    Args:
+        previous_ref: Previous HEAD reference
+        current_ref: New HEAD reference
+        branch_flag: "1" for branch checkout, "0" for file checkout
+    """
+    try:
+        config_obj = ctx.obj["config"]
+
+        # Import here to avoid circular imports
+        from .git import GitHookManager
+
+        # Initialize hook manager
+        hook_manager = GitHookManager(config_obj)
+
+        # Handle post-checkout
+        import asyncio
+        exit_code = asyncio.run(hook_manager.handle_post_checkout(
+            previous_ref, current_ref, branch_flag
+        ))
+
+        sys.exit(exit_code)
+
+    except Exception as e:
+        # Hook errors should not fail Git operations
+        logger = logging.getLogger(__name__)
+        logger.error(f"Post-checkout hook error: {e}")
+        sys.exit(0)
+
+
+@hook.command("post-merge")
+@click.argument("merge_commit", default="HEAD")
+@click.pass_context
+def hook_post_merge(ctx: click.Context, merge_commit: str) -> None:
+    """Handle post-merge hook execution (called by Git).
+    
+    This command is called automatically by Git during merge operations.
+    It should not be run manually unless testing hook functionality.
+
+    Args:
+        merge_commit: Merge commit reference (defaults to HEAD)
+    """
+    try:
+        config_obj = ctx.obj["config"]
+
+        # Import here to avoid circular imports
+        from .git import GitHookManager
+
+        # Initialize hook manager
+        hook_manager = GitHookManager(config_obj)
+
+        # Handle post-merge
+        import asyncio
+        exit_code = asyncio.run(hook_manager.handle_post_merge(merge_commit))
+
+        sys.exit(exit_code)
+
+    except Exception as e:
+        # Hook errors should not fail Git operations
+        logger = logging.getLogger(__name__)
+        logger.error(f"Post-merge hook error: {e}")
+        sys.exit(0)
 
 
 if __name__ == "__main__":

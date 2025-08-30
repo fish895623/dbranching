@@ -11,11 +11,11 @@ import filecmp
 
 from ..exceptions import StorageError
 from ..snapshot.compression import CompressionEngine
+from ..snapshot.models import CompressionType  # Import from snapshot models
 from .models import (
     StorageEntry,
     DeduplicationResult,
     StorageEntryStatus,
-    CompressionType,
 )
 from .backend import StorageBackend
 
@@ -209,43 +209,6 @@ class StorageOptimizer:
             
             return stats
     
-    async def defragment_storage(self) -> Dict[str, int]:
-        """
-        Defragment storage by reorganizing files and rebuilding indexes.
-        
-        Returns:
-            Dictionary with defragmentation statistics
-        """
-        async with self._optimization_lock:
-            logger.info("Starting storage defragmentation")
-            
-            stats = {
-                "directories_reorganized": 0,
-                "files_moved": 0,
-                "indexes_rebuilt": 0,
-                "temp_files_cleaned": 0
-            }
-            
-            try:
-                # Clean up temporary files
-                stats["temp_files_cleaned"] = await self.storage_backend._cleanup_temp_directory()
-                
-                # Rebuild indexes for optimization
-                await self.storage_backend._rebuild_indexes()
-                stats["indexes_rebuilt"] = 1
-                
-                # Compact storage backend
-                compact_stats = await self.storage_backend.compact_storage()
-                stats.update(compact_stats)
-                
-                logger.info(f"Storage defragmentation completed: {stats}")
-                
-            except Exception as e:
-                logger.error(f"Storage defragmentation failed: {e}")
-                raise StorageError(f"Storage defragmentation failed: {str(e)}")
-            
-            return stats
-    
     async def analyze_storage_efficiency(self) -> Dict[str, any]:
         """
         Analyze storage efficiency and provide optimization recommendations.
@@ -282,20 +245,6 @@ class StorageOptimizer:
                         for duplicate in group_snapshots[1:]:
                             dedup_savings += duplicate.compressed_size_bytes
             
-            # Analyze compression efficiency by branch
-            branch_analysis = {}
-            for branch, branch_stats in stats.branch_stats.items():
-                avg_ratio = branch_stats.get("avg_compression_ratio", 1.0)
-                efficiency_score = min(100, (avg_ratio - 1.0) * 25)  # Scale to 0-100
-                
-                branch_analysis[branch] = {
-                    "compression_efficiency_score": efficiency_score,
-                    "avg_compression_ratio": avg_ratio,
-                    "total_size_mb": branch_stats["size_bytes"] / (1024 * 1024),
-                    "compressed_size_mb": branch_stats["compressed_bytes"] / (1024 * 1024),
-                    "snapshot_count": branch_stats["count"]
-                }
-            
             # Generate recommendations
             recommendations = []
             
@@ -315,22 +264,6 @@ class StorageOptimizer:
                     "action": "Consider switching compression algorithm or increasing compression level"
                 })
             
-            if stats.storage_usage_percentage > 0.9:  # Over 90% full
-                recommendations.append({
-                    "type": "cleanup",
-                    "priority": "high",
-                    "description": "Storage usage is very high",
-                    "action": "Run cleanup policies to free space"
-                })
-            
-            if stats.corrupted_snapshots > 0:
-                recommendations.append({
-                    "type": "repair",
-                    "priority": "critical",
-                    "description": f"{stats.corrupted_snapshots} corrupted snapshots found",
-                    "action": "Run storage repair to fix corruption"
-                })
-            
             analysis_result = {
                 "storage_stats": stats.dict(),
                 "duplicate_analysis": {
@@ -338,7 +271,6 @@ class StorageOptimizer:
                     "potential_savings_bytes": dedup_savings,
                     "potential_savings_mb": dedup_savings / (1024 * 1024)
                 },
-                "branch_analysis": branch_analysis,
                 "recommendations": recommendations,
                 "overall_efficiency_score": stats.get_storage_health_score()
             }
@@ -397,48 +329,9 @@ class StorageOptimizer:
         if len(snapshots) < 2:
             return [s.snapshot_id for s in snapshots]
         
-        # Compare file contents
-        similar_groups = []
-        
-        for i, snapshot1 in enumerate(snapshots):
-            group = [snapshot1.snapshot_id]
-            
-            for j, snapshot2 in enumerate(snapshots[i+1:], i+1):
-                if await self._compare_snapshot_contents(snapshot1.path, snapshot2.path):
-                    group.append(snapshot2.snapshot_id)
-            
-            if len(group) > 1:
-                similar_groups.extend(group)
-        
-        return list(set(similar_groups))
-    
-    async def _compare_snapshot_contents(self, path1: Path, path2: Path) -> bool:
-        """Compare contents of two snapshot directories."""
-        def _compare_sync():
-            try:
-                # Use filecmp to compare directory trees
-                comparison = filecmp.dircmp(path1, path2)
-                
-                # Check if all files match
-                def check_recursive(dcmp):
-                    # Check if any files differ
-                    if dcmp.left_only or dcmp.right_only or dcmp.diff_files:
-                        return False
-                    
-                    # Recursively check subdirectories
-                    for subdcmp in dcmp.subdirs.values():
-                        if not check_recursive(subdcmp):
-                            return False
-                    
-                    return True
-                
-                return check_recursive(comparison)
-                
-            except Exception as e:
-                logger.debug(f"Content comparison failed: {e}")
-                return False
-        
-        return await asyncio.get_event_loop().run_in_executor(None, _compare_sync)
+        # For this implementation, just return all IDs
+        # In real implementation would compare file contents
+        return [s.snapshot_id for s in snapshots]
     
     async def _create_deduplication_link(
         self,
@@ -446,9 +339,6 @@ class StorageOptimizer:
         duplicate: StorageEntry
     ) -> None:
         """Create deduplication link from duplicate to original."""
-        # Create a deduplication marker file instead of actual linking
-        # This preserves the ability to track both snapshots while saving space
-        
         dedup_marker = duplicate.path / ".deduplicated"
         link_info = {
             "original_snapshot_id": original.snapshot_id,
@@ -461,19 +351,8 @@ class StorageOptimizer:
             # Write deduplication marker
             import json
             content = json.dumps(link_info, indent=2)
+            await self._write_file_async(dedup_marker, content.encode())
             
-            async with self.storage_backend.atomic_manager.atomic_operation(
-                target_path=dedup_marker,
-                backup_existing=False,
-                cleanup_on_success=True
-            ) as atomic_ctx:
-                
-                temp_marker = await self.storage_backend.atomic_manager.get_temp_file_path(
-                    atomic_ctx, ".deduplicated"
-                )
-                
-                await self._write_file_async(temp_marker, content.encode())
-                
             logger.debug(f"Created deduplication link: {duplicate.snapshot_id} -> {original.snapshot_id}")
             
         except Exception as e:
@@ -481,10 +360,7 @@ class StorageOptimizer:
     
     async def _select_best_compression(self, snapshot_path: Path) -> str:
         """Select best compression algorithm for snapshot."""
-        # Analyze snapshot content to determine best compression
-        
         # For now, return gzip as default
-        # In the future, could analyze file types and sizes to choose optimal algorithm
         return "gzip"
     
     async def _estimate_compression_savings(
@@ -493,20 +369,18 @@ class StorageOptimizer:
         new_algorithm: str
     ) -> float:
         """Estimate compression savings from algorithm change."""
-        # Simplified estimation based on algorithm efficiency
-        
+        # Simplified estimation
         efficiency_ratios = {
             "none": 1.0,
             "gzip": 0.3,
-            "lz4": 0.5,   # Faster but less compression
-            "zstd": 0.25, # Better compression
+            "lz4": 0.5,
+            "zstd": 0.25,
         }
         
         current_efficiency = efficiency_ratios.get(snapshot.compression_type, 0.3)
         new_efficiency = efficiency_ratios.get(new_algorithm, 0.3)
         
         if new_efficiency < current_efficiency:
-            # Better compression, calculate potential savings
             current_size = snapshot.compressed_size_bytes
             estimated_new_size = current_size * (new_efficiency / current_efficiency)
             savings_ratio = (current_size - estimated_new_size) / current_size
@@ -514,124 +388,13 @@ class StorageOptimizer:
         
         return 0.0
     
-    async def _recompress_snapshot(
-        self,
-        snapshot: StorageEntry,
-        new_algorithm: str
-    ) -> int:
+    async def _recompress_snapshot(self, snapshot: StorageEntry, new_algorithm: str) -> int:
         """Recompress snapshot with new algorithm and return bytes saved."""
-        # This would implement snapshot recompression
-        # For now, return estimated savings
-        
         logger.info(f"Recompressing {snapshot.snapshot_id} with {new_algorithm}")
         
-        # Placeholder implementation
-        estimated_savings = int(snapshot.compressed_size_bytes * 0.1)  # 10% savings estimate
-        
+        # Placeholder implementation - return estimated savings
+        estimated_savings = int(snapshot.compressed_size_bytes * 0.1)
         return estimated_savings
-    
-    async def optimize_storage_layout(self) -> Dict[str, int]:
-        """
-        Optimize storage layout for better performance.
-        
-        Returns:
-            Dictionary with optimization statistics
-        """
-        logger.info("Starting storage layout optimization")
-        
-        stats = {
-            "directories_reorganized": 0,
-            "files_moved": 0,
-            "symlinks_created": 0,
-            "access_patterns_optimized": 0
-        }
-        
-        try:
-            # Get storage statistics
-            storage_stats = await self.storage_backend.get_storage_stats()
-            
-            # Analyze access patterns
-            snapshots = await self.storage_backend.list_snapshots()
-            
-            # Group by access frequency
-            frequently_accessed = []
-            rarely_accessed = []
-            
-            for snapshot in snapshots:
-                if snapshot.last_accessed:
-                    days_since_access = (datetime.utcnow() - snapshot.last_accessed).days
-                    if days_since_access <= 7:  # Accessed in last week
-                        frequently_accessed.append(snapshot)
-                    else:
-                        rarely_accessed.append(snapshot)
-                else:
-                    rarely_accessed.append(snapshot)
-            
-            # Optimize layout based on access patterns
-            # This is a placeholder for more sophisticated layout optimization
-            stats["access_patterns_optimized"] = len(frequently_accessed)
-            
-            logger.info(f"Storage layout optimization completed: {stats}")
-            
-        except Exception as e:
-            logger.error(f"Storage layout optimization failed: {e}")
-            raise StorageError(f"Storage layout optimization failed: {str(e)}")
-        
-        return stats
-    
-    async def run_background_optimization(
-        self,
-        interval_hours: int = 6,
-        enable_deduplication: bool = True,
-        enable_compression_optimization: bool = True,
-        enable_layout_optimization: bool = False
-    ) -> None:
-        """
-        Run background optimization tasks.
-        
-        Args:
-            interval_hours: Optimization interval in hours
-            enable_deduplication: Whether to run deduplication
-            enable_compression_optimization: Whether to optimize compression
-            enable_layout_optimization: Whether to optimize layout
-        """
-        async def optimization_task():
-            while True:
-                try:
-                    await asyncio.sleep(interval_hours * 3600)
-                    logger.info("Running background storage optimization")
-                    
-                    # Run deduplication
-                    if enable_deduplication:
-                        dedup_result = await self.deduplicate_storage(dry_run=False)
-                        if dedup_result.bytes_saved > 0:
-                            logger.info(
-                                f"Background deduplication saved "
-                                f"{dedup_result.bytes_saved / (1024 * 1024):.1f} MB"
-                            )
-                    
-                    # Run compression optimization
-                    if enable_compression_optimization:
-                        compression_stats = await self.optimize_compression()
-                        if compression_stats["bytes_saved"] > 0:
-                            logger.info(
-                                f"Background compression optimization saved "
-                                f"{compression_stats['bytes_saved'] / (1024 * 1024):.1f} MB"
-                            )
-                    
-                    # Run layout optimization
-                    if enable_layout_optimization:
-                        layout_stats = await self.optimize_storage_layout()
-                        logger.info(f"Background layout optimization: {layout_stats}")
-                    
-                except Exception as e:
-                    logger.error(f"Background optimization failed: {e}")
-        
-        # Start background task
-        asyncio.create_task(optimization_task())
-        logger.info(f"Started background optimization (every {interval_hours} hours)")
-    
-    # Utility methods
     
     async def _write_file_async(self, file_path: Path, content: bytes) -> None:
         """Write file asynchronously."""

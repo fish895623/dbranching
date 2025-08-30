@@ -1,9 +1,11 @@
 """Storage backend for database snapshots with atomic operations and organization."""
 
 import asyncio
+import hashlib
 import logging
 import sqlite3
 import uuid
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple, AsyncContextManager
@@ -30,86 +32,113 @@ logger = logging.getLogger(__name__)
 
 class StorageBackend:
     """
-    Storage backend providing atomic operations, path organization, and metadata tracking.
+    Storage backend for database snapshots providing atomic operations,
+    metadata tracking, and efficient organization.
     
     Features:
-    - Atomic write operations with rollback capability
-    - Organized storage paths by project and branch
-    - SQLite index for efficient queries
+    - Atomic storage operations with rollback
     - Branch ancestry tracking for fallback chains
-    - Integrity verification and repair
+    - Metadata indexing with SQLite/JSON
+    - Storage validation and integrity checks
+    - Efficient snapshot organization by project/branch
     """
     
-    def __init__(
-        self,
-        storage_config: StorageConfig,
-        project_name: str = "default",
-        atomic_manager: Optional[AtomicOperationManager] = None
-    ):
+    def __init__(self, storage_config: StorageConfig, project_name: str):
         """
         Initialize storage backend.
         
         Args:
             storage_config: Storage configuration
-            project_name: Project name for path organization
-            atomic_manager: Optional atomic operation manager
+            project_name: Project name for organization
         """
         self.storage_config = storage_config
         self.project_name = project_name
-        self.atomic_manager = atomic_manager or AtomicOperationManager()
         
-        # Setup storage paths
-        self.base_path = storage_config.path
-        self.project_path = self.base_path / project_name
+        # Setup paths
+        self.project_path = storage_config.path / project_name
         self.snapshots_path = self.project_path / "snapshots"
         self.metadata_path = self.project_path / "metadata"
         self.temp_path = self.project_path / "temp"
-        self.index_path = self.metadata_path / "index.db"
         
-        # Initialize storage index
-        self._index: Optional[StorageIndex] = None
-        self._index_lock = asyncio.Lock()
+        # Initialize atomic operation manager
+        self.atomic_manager = AtomicOperationManager(base_temp_dir=self.temp_path)
         
         # Create directory structure
-        self._ensure_directory_structure()
-        
-        logger.info(f"Storage backend initialized for project '{project_name}' at {self.base_path}")
-    
-    def _ensure_directory_structure(self) -> None:
-        """Ensure storage directory structure exists."""
-        for path in [self.snapshots_path, self.metadata_path, self.temp_path]:
+        for path in [self.project_path, self.snapshots_path, self.metadata_path, self.temp_path]:
             path.mkdir(parents=True, exist_ok=True)
+        
+        # Initialize metadata index
+        self.index_db_path = self.metadata_path / "storage_index.db"
+        self._index_initialized = False
+        
+        logger.info(f"Storage backend initialized for project '{project_name}'")
+    
+    async def _ensure_index_initialized(self) -> None:
+        """Ensure SQLite index is initialized (call before first use)."""
+        if not self._index_initialized:
+            await self._initialize_index()
+            self._index_initialized = True
+    
+    async def _initialize_index(self) -> None:
+        """Initialize SQLite index for metadata."""
+        def _create_tables():
+            with sqlite3.connect(self.index_db_path) as conn:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS snapshots (
+                        snapshot_id TEXT PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        branch TEXT NOT NULL,
+                        parent_branch TEXT,
+                        path TEXT NOT NULL,
+                        size_bytes INTEGER NOT NULL,
+                        compressed_size_bytes INTEGER NOT NULL,
+                        checksum TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        last_accessed TEXT,
+                        database_type TEXT NOT NULL,
+                        database_version TEXT NOT NULL,
+                        compression_type TEXT NOT NULL,
+                        compression_ratio REAL NOT NULL,
+                        git_commit TEXT,
+                        git_author TEXT,
+                        status TEXT NOT NULL DEFAULT 'active',
+                        tags TEXT,
+                        description TEXT
+                    )
+                """)
+                
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS branch_ancestry (
+                        branch TEXT PRIMARY KEY,
+                        parent_branch TEXT,
+                        ancestor_snapshots TEXT,
+                        snapshots TEXT,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    )
+                """)
+                
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_snapshots_branch ON snapshots(branch)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_snapshots_created_at ON snapshots(created_at)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_snapshots_checksum ON snapshots(checksum)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_snapshots_status ON snapshots(status)")
+        
+        await asyncio.get_event_loop().run_in_executor(None, _create_tables)
     
     async def get_snapshot_path(self, branch: str, snapshot_name: str) -> Path:
         """
-        Get organized storage path for snapshot.
+        Get path for snapshot storage with branch organization.
         
         Args:
-            branch: Git branch name
+            branch: Git branch name  
             snapshot_name: Snapshot name
             
         Returns:
-            Path to snapshot directory
+            Path for snapshot storage
         """
         # Sanitize branch name for filesystem
-        safe_branch = self._sanitize_branch_name(branch)
-        branch_path = self.snapshots_path / safe_branch
-        return branch_path / snapshot_name
-    
-    def _sanitize_branch_name(self, branch: str) -> str:
-        """Sanitize branch name for filesystem usage."""
-        # Replace problematic characters
-        safe_name = branch.replace("/", "_").replace("\\", "_")
-        safe_name = safe_name.replace(":", "_").replace("*", "_")
-        safe_name = safe_name.replace("?", "_").replace('"', "_")
-        safe_name = safe_name.replace("<", "_").replace(">", "_")
-        safe_name = safe_name.replace("|", "_")
-        
-        # Limit length
-        if len(safe_name) > 100:
-            safe_name = safe_name[:100]
-        
-        return safe_name
+        safe_branch = branch.replace("/", "_").replace("\\", "_")
+        return self.snapshots_path / safe_branch / snapshot_name
     
     async def store_snapshot(
         self,
@@ -137,13 +166,17 @@ class StorageBackend:
         Raises:
             StorageError: If storage operation fails
         """
+        await self._ensure_index_initialized()
+        
         target_path = await self.get_snapshot_path(branch, snapshot_metadata.name)
         
         # Check if snapshot already exists
         if target_path.exists():
             raise StorageError(f"Snapshot already exists at {target_path}")
         
-        snapshot_id = str(uuid.uuid4())
+        # Validate source path
+        if not source_path.exists() or not source_path.is_dir():
+            raise StorageError(f"Invalid source path: {source_path}")
         
         try:
             # Use atomic operation for safe storage
@@ -151,55 +184,58 @@ class StorageBackend:
                 target_path=target_path,
                 backup_existing=False,
                 cleanup_on_success=True
-            ) as atomic_ctx:
+            ) as context:
                 
-                # Copy snapshot directory to temporary location
-                temp_snapshot_path = await self.atomic_manager.get_temp_dir_path(
-                    atomic_ctx, snapshot_metadata.name
-                )
+                # Copy snapshot files to temporary location
+                temp_snapshot_path = context.temp_dir / "snapshot"
+                await self._copy_snapshot_files(source_path, temp_snapshot_path)
                 
-                # Copy all files from source to temp
-                await self._copy_directory_async(source_path, temp_snapshot_path)
-                
-                # Calculate storage metadata
-                total_size = await self._calculate_directory_size(temp_snapshot_path)
-                compressed_size = sum(f.size_bytes for f in snapshot_metadata.files)
+                # Calculate checksum for integrity
                 checksum = await self._calculate_directory_checksum(temp_snapshot_path)
                 
                 # Create storage entry
                 storage_entry = StorageEntry(
-                    snapshot_id=snapshot_id,
+                    snapshot_id=str(uuid.uuid4()),
                     name=snapshot_metadata.name,
                     branch=branch,
                     parent_branch=parent_branch,
                     path=target_path,
-                    size_bytes=total_size,
-                    compressed_size_bytes=compressed_size,
+                    size_bytes=snapshot_metadata.total_size_bytes,
+                    compressed_size_bytes=snapshot_metadata.total_size_bytes,  # Will be updated after copy
                     checksum=checksum,
-                    created_at=snapshot_metadata.created_at,
-                    status=StorageEntryStatus.ACTIVE,
-                    tags=snapshot_metadata.tags,
-                    description=snapshot_metadata.description,
+                    created_at=datetime.utcnow(),
                     database_type=snapshot_metadata.database.type,
                     database_version=snapshot_metadata.database.version,
                     compression_type=snapshot_metadata.compression.value,
                     compression_ratio=snapshot_metadata.compression_ratio,
                     git_commit=git_commit,
-                    git_author=git_author
+                    git_author=git_author,
+                    tags=snapshot_metadata.tags,
+                    description=snapshot_metadata.description
                 )
                 
-                # Add to storage index
-                await self._add_to_index(storage_entry)
+                # Update compressed size based on actual files
+                actual_size = await self._calculate_directory_size(temp_snapshot_path)
+                storage_entry.compressed_size_bytes = actual_size
+                
+                # Store metadata
+                await self._store_snapshot_metadata(storage_entry, snapshot_metadata, temp_snapshot_path)
+                
+                # Move from temp to final location (atomic commit)
+                await self._atomic_move(temp_snapshot_path, target_path)
+                
+                # Update index
+                await self._update_index(storage_entry)
                 
                 # Update branch ancestry
-                await self._update_branch_ancestry(branch, parent_branch, snapshot_id)
+                await self._update_branch_ancestry(branch, parent_branch, storage_entry.snapshot_id)
                 
-                logger.info(f"Stored snapshot {snapshot_metadata.name} at {target_path}")
+                logger.info(f"Stored snapshot {storage_entry.snapshot_id} at {target_path}")
                 return storage_entry
                 
         except Exception as e:
-            logger.error(f"Failed to store snapshot {snapshot_metadata.name}: {e}")
-            raise StorageError(f"Failed to store snapshot: {str(e)}")
+            logger.error(f"Failed to store snapshot: {e}")
+            raise StorageError(f"Storage operation failed: {str(e)}")
     
     async def retrieve_snapshot(
         self,
@@ -207,379 +243,199 @@ class StorageBackend:
         update_access_time: bool = True
     ) -> Optional[StorageEntry]:
         """
-        Retrieve snapshot entry by ID.
+        Retrieve snapshot by ID.
         
         Args:
             snapshot_id: Snapshot identifier
-            update_access_time: Whether to update last access time
+            update_access_time: Whether to update last accessed time
             
         Returns:
             StorageEntry if found, None otherwise
         """
-        index = await self._get_index()
-        entry = index.entries.get(snapshot_id)
+        await self._ensure_index_initialized()
         
-        if entry and update_access_time:
-            entry.last_accessed = datetime.utcnow()
-            await self._update_index_entry(entry)
-        
-        return entry
+        try:
+            def _query_snapshot():
+                with sqlite3.connect(self.index_db_path) as conn:
+                    conn.row_factory = sqlite3.Row
+                    cursor = conn.execute(
+                        "SELECT * FROM snapshots WHERE snapshot_id = ?",
+                        (snapshot_id,)
+                    )
+                    return cursor.fetchone()
+            
+            row = await asyncio.get_event_loop().run_in_executor(None, _query_snapshot)
+            
+            if not row:
+                return None
+            
+            # Create storage entry from row
+            storage_entry = StorageEntry(
+                snapshot_id=row["snapshot_id"],
+                name=row["name"],
+                branch=row["branch"],
+                parent_branch=row["parent_branch"],
+                path=Path(row["path"]),
+                size_bytes=row["size_bytes"],
+                compressed_size_bytes=row["compressed_size_bytes"],
+                checksum=row["checksum"],
+                created_at=datetime.fromisoformat(row["created_at"]),
+                last_accessed=datetime.fromisoformat(row["last_accessed"]) if row["last_accessed"] else None,
+                database_type=row["database_type"],
+                database_version=row["database_version"],
+                compression_type=row["compression_type"],
+                compression_ratio=row["compression_ratio"],
+                git_commit=row["git_commit"],
+                git_author=row["git_author"],
+                status=StorageEntryStatus(row["status"]),
+                tags=json.loads(row["tags"]) if row["tags"] else [],
+                description=row["description"]
+            )
+            
+            # Update access time if requested
+            if update_access_time:
+                await self._update_access_time(snapshot_id)
+            
+            return storage_entry
+            
+        except Exception as e:
+            logger.error(f"Failed to retrieve snapshot {snapshot_id}: {e}")
+            return None
     
     async def list_snapshots(
         self,
         branch: Optional[str] = None,
-        tags: Optional[Set[str]] = None,
         status: Optional[StorageEntryStatus] = None,
-        limit: Optional[int] = None,
-        offset: int = 0
+        tags: Optional[List[str]] = None,
+        limit: Optional[int] = None
     ) -> List[StorageEntry]:
         """
-        List snapshots with filtering and pagination.
+        List snapshots with optional filtering.
         
         Args:
             branch: Filter by branch name
-            tags: Filter by tags (any match)
             status: Filter by status
+            tags: Filter by tags (all must be present)
             limit: Maximum number of results
-            offset: Number of results to skip
             
         Returns:
-            List of matching StorageEntry objects
+            List of StorageEntry objects
         """
-        index = await self._get_index()
-        snapshots = list(index.entries.values())
+        await self._ensure_index_initialized()
         
-        # Apply filters
-        if branch:
-            snapshots = [s for s in snapshots if s.branch == branch]
-        
-        if tags:
-            snapshots = [s for s in snapshots if any(tag in s.tags for tag in tags)]
-        
-        if status:
-            snapshots = [s for s in snapshots if s.status == status]
-        
-        # Sort by creation time (newest first)
-        snapshots.sort(key=lambda s: s.created_at, reverse=True)
-        
-        # Apply pagination
-        if offset > 0:
-            snapshots = snapshots[offset:]
-        
-        if limit:
-            snapshots = snapshots[:limit]
-        
-        return snapshots
+        try:
+            def _query_snapshots():
+                with sqlite3.connect(self.index_db_path) as conn:
+                    conn.row_factory = sqlite3.Row
+                    
+                    query = "SELECT * FROM snapshots WHERE 1=1"
+                    params = []
+                    
+                    if branch:
+                        query += " AND branch = ?"
+                        params.append(branch)
+                    
+                    if status:
+                        query += " AND status = ?"
+                        params.append(status.value)
+                    
+                    query += " ORDER BY created_at DESC"
+                    
+                    if limit:
+                        query += " LIMIT ?"
+                        params.append(limit)
+                    
+                    cursor = conn.execute(query, params)
+                    return cursor.fetchall()
+            
+            rows = await asyncio.get_event_loop().run_in_executor(None, _query_snapshots)
+            
+            snapshots = []
+            for row in rows:
+                try:
+                    storage_entry = StorageEntry(
+                        snapshot_id=row["snapshot_id"],
+                        name=row["name"],
+                        branch=row["branch"],
+                        parent_branch=row["parent_branch"],
+                        path=Path(row["path"]),
+                        size_bytes=row["size_bytes"],
+                        compressed_size_bytes=row["compressed_size_bytes"],
+                        checksum=row["checksum"],
+                        created_at=datetime.fromisoformat(row["created_at"]),
+                        last_accessed=datetime.fromisoformat(row["last_accessed"]) if row["last_accessed"] else None,
+                        database_type=row["database_type"],
+                        database_version=row["database_version"],
+                        compression_type=row["compression_type"],
+                        compression_ratio=row["compression_ratio"],
+                        git_commit=row["git_commit"],
+                        git_author=row["git_author"],
+                        status=StorageEntryStatus(row["status"]),
+                        tags=json.loads(row["tags"]) if row["tags"] else [],
+                        description=row["description"]
+                    )
+                    
+                    # Apply tag filtering if specified
+                    if tags:
+                        if all(tag in storage_entry.tags for tag in tags):
+                            snapshots.append(storage_entry)
+                    else:
+                        snapshots.append(storage_entry)
+                        
+                except Exception as e:
+                    logger.warning(f"Failed to parse snapshot entry: {e}")
+                    continue
+            
+            return snapshots
+            
+        except Exception as e:
+            logger.error(f"Failed to list snapshots: {e}")
+            raise StorageError(f"Failed to list snapshots: {str(e)}")
     
-    async def delete_snapshot(self, snapshot_id: str, force: bool = False) -> bool:
+    async def delete_snapshot(self, snapshot_id: str) -> bool:
         """
-        Delete snapshot with atomic operations.
+        Delete snapshot and update metadata.
         
         Args:
             snapshot_id: Snapshot identifier
-            force: Force deletion even if snapshot has dependencies
             
         Returns:
-            True if deleted successfully
+            True if deleted, False if not found
             
         Raises:
             StorageError: If deletion fails
-            ValidationError: If snapshot has dependencies and force=False
         """
-        index = await self._get_index()
-        entry = index.entries.get(snapshot_id)
-        
-        if not entry:
-            logger.warning(f"Snapshot {snapshot_id} not found in index")
-            return False
-        
-        # Check for dependencies unless forcing
-        if not force and entry.child_snapshots:
-            raise ValidationError(
-                f"Snapshot {snapshot_id} has child snapshots: {entry.child_snapshots}. "
-                "Use force=True to delete anyway."
-            )
+        await self._ensure_index_initialized()
         
         try:
+            # Get snapshot entry
+            storage_entry = await self.retrieve_snapshot(snapshot_id, update_access_time=False)
+            if not storage_entry:
+                return False
+            
             # Use atomic operation for safe deletion
             async with self.atomic_manager.atomic_operation(
-                target_path=entry.path,
+                target_path=storage_entry.path,
                 backup_existing=True,
-                cleanup_on_success=True
-            ) as atomic_ctx:
+                cleanup_on_success=False  # Keep backup until we're sure
+            ) as context:
                 
-                # Remove from filesystem
-                if entry.path.exists():
-                    await asyncio.get_event_loop().run_in_executor(
-                        None, shutil.rmtree, entry.path
-                    )
-                
-                # Remove from index
+                # Remove from index first
                 await self._remove_from_index(snapshot_id)
                 
+                # Remove snapshot directory
+                if storage_entry.path.exists():
+                    await self._remove_directory_async(storage_entry.path)
+                
                 # Update branch ancestry
-                await self._update_ancestry_after_deletion(entry)
+                await self._remove_from_branch_ancestry(branch=storage_entry.branch, snapshot_id=snapshot_id)
                 
                 logger.info(f"Deleted snapshot {snapshot_id}")
                 return True
                 
         except Exception as e:
             logger.error(f"Failed to delete snapshot {snapshot_id}: {e}")
-            raise StorageError(f"Failed to delete snapshot: {str(e)}")
-    
-    async def get_storage_stats(self) -> StorageStats:
-        """
-        Get comprehensive storage statistics.
-        
-        Returns:
-            StorageStats with usage and health information
-        """
-        index = await self._get_index()
-        entries = list(index.entries.values())
-        
-        if not entries:
-            return StorageStats(
-                total_snapshots=0,
-                total_size_bytes=0,
-                total_compressed_bytes=0,
-                average_compression_ratio=0.0,
-                storage_efficiency=0.0,
-                storage_usage_percentage=0.0
-            )
-        
-        # Calculate basic statistics
-        total_snapshots = len(entries)
-        total_size = sum(e.size_bytes for e in entries)
-        total_compressed = sum(e.compressed_size_bytes for e in entries)
-        
-        # Calculate compression statistics
-        compression_ratios = [e.compression_ratio for e in entries if e.compression_ratio > 0]
-        avg_compression = sum(compression_ratios) / len(compression_ratios) if compression_ratios else 1.0
-        storage_efficiency = (1.0 - (total_compressed / total_size)) * 100 if total_size > 0 else 0.0
-        
-        # Calculate branch statistics
-        branch_stats = {}
-        for entry in entries:
-            if entry.branch not in branch_stats:
-                branch_stats[entry.branch] = {
-                    "count": 0,
-                    "size_bytes": 0,
-                    "compressed_bytes": 0,
-                    "avg_compression_ratio": 0.0
-                }
-            
-            stats = branch_stats[entry.branch]
-            stats["count"] += 1
-            stats["size_bytes"] += entry.size_bytes
-            stats["compressed_bytes"] += entry.compressed_size_bytes
-        
-        # Calculate average compression per branch
-        for branch, stats in branch_stats.items():
-            if stats["size_bytes"] > 0:
-                stats["avg_compression_ratio"] = stats["size_bytes"] / stats["compressed_bytes"]
-        
-        # Calculate health metrics
-        corrupted_count = len([e for e in entries if e.status == StorageEntryStatus.CORRUPTED])
-        orphaned_count = len([e for e in entries if e.status == StorageEntryStatus.ORPHANED])
-        
-        # Calculate storage usage percentage
-        storage_limit = self._parse_size_string(self.storage_config.max_size)
-        usage_percentage = total_compressed / storage_limit if storage_limit > 0 else 0.0
-        
-        # Find temporal bounds
-        sorted_entries = sorted(entries, key=lambda e: e.created_at)
-        oldest = sorted_entries[0].created_at if sorted_entries else None
-        newest = sorted_entries[-1].created_at if sorted_entries else None
-        
-        return StorageStats(
-            total_snapshots=total_snapshots,
-            total_size_bytes=total_size,
-            total_compressed_bytes=total_compressed,
-            branch_stats=branch_stats,
-            average_compression_ratio=avg_compression,
-            storage_efficiency=storage_efficiency,
-            corrupted_snapshots=corrupted_count,
-            orphaned_snapshots=orphaned_count,
-            storage_limit_bytes=storage_limit,
-            storage_usage_percentage=usage_percentage,
-            storage_warning_threshold=self.storage_config.monitoring_threshold,
-            oldest_snapshot=oldest,
-            newest_snapshot=newest
-        )
-    
-    async def validate_storage_integrity(self) -> StorageValidationResult:
-        """
-        Validate storage integrity and detect issues.
-        
-        Returns:
-            StorageValidationResult with validation details
-        """
-        start_time = datetime.utcnow()
-        index = await self._get_index()
-        
-        total_snapshots = len(index.entries)
-        valid_snapshots = 0
-        corrupted_snapshots = []
-        orphaned_files = []
-        missing_files = []
-        index_inconsistencies = []
-        repairable_issues = []
-        manual_fixes_required = []
-        
-        # Validate each snapshot entry
-        for snapshot_id, entry in index.entries.items():
-            try:
-                # Check if snapshot directory exists
-                if not entry.path.exists():
-                    missing_files.append(str(entry.path))
-                    corrupted_snapshots.append(snapshot_id)
-                    repairable_issues.append(f"Missing snapshot directory: {entry.path}")
-                    continue
-                
-                # Check if metadata file exists
-                metadata_file = entry.path / "metadata.json"
-                if not metadata_file.exists():
-                    missing_files.append(str(metadata_file))
-                    corrupted_snapshots.append(snapshot_id)
-                    repairable_issues.append(f"Missing metadata file: {metadata_file}")
-                    continue
-                
-                # Verify checksum if possible
-                actual_checksum = await self._calculate_directory_checksum(entry.path)
-                if actual_checksum != entry.checksum:
-                    corrupted_snapshots.append(snapshot_id)
-                    manual_fixes_required.append(
-                        f"Checksum mismatch for {snapshot_id}: "
-                        f"expected {entry.checksum}, got {actual_checksum}"
-                    )
-                    continue
-                
-                valid_snapshots += 1
-                
-            except Exception as e:
-                corrupted_snapshots.append(snapshot_id)
-                manual_fixes_required.append(f"Validation error for {snapshot_id}: {str(e)}")
-        
-        # Check for orphaned files (files not in index)
-        if self.snapshots_path.exists():
-            for branch_dir in self.snapshots_path.iterdir():
-                if not branch_dir.is_dir():
-                    continue
-                
-                for snapshot_dir in branch_dir.iterdir():
-                    if not snapshot_dir.is_dir():
-                        continue
-                    
-                    # Check if this snapshot is in the index
-                    snapshot_in_index = any(
-                        entry.path == snapshot_dir 
-                        for entry in index.entries.values()
-                    )
-                    
-                    if not snapshot_in_index:
-                        orphaned_files.append(str(snapshot_dir))
-                        repairable_issues.append(f"Orphaned snapshot directory: {snapshot_dir}")
-        
-        # Validate index consistency
-        index_valid = True
-        
-        # Check branch index consistency
-        for branch, snapshot_ids in index.branch_index.items():
-            for snapshot_id in snapshot_ids:
-                if snapshot_id not in index.entries:
-                    index_inconsistencies.append(f"Branch index references missing snapshot: {snapshot_id}")
-                    index_valid = False
-                elif index.entries[snapshot_id].branch != branch:
-                    index_inconsistencies.append(
-                        f"Branch index mismatch: {snapshot_id} indexed under {branch} "
-                        f"but belongs to {index.entries[snapshot_id].branch}"
-                    )
-                    index_valid = False
-        
-        validation_time = (datetime.utcnow() - start_time).total_seconds()
-        
-        return StorageValidationResult(
-            valid=valid_snapshots == total_snapshots and index_valid,
-            total_snapshots=total_snapshots,
-            valid_snapshots=valid_snapshots,
-            corrupted_snapshots=corrupted_snapshots,
-            orphaned_files=orphaned_files,
-            missing_files=missing_files,
-            index_valid=index_valid,
-            index_inconsistencies=index_inconsistencies,
-            repairable_issues=repairable_issues,
-            manual_fixes_required=manual_fixes_required,
-            validation_time_seconds=validation_time
-        )
-    
-    async def repair_storage(
-        self,
-        auto_repair: bool = True,
-        remove_orphaned: bool = False
-    ) -> StorageValidationResult:
-        """
-        Repair storage issues automatically where possible.
-        
-        Args:
-            auto_repair: Whether to automatically repair repairable issues
-            remove_orphaned: Whether to remove orphaned files
-            
-        Returns:
-            StorageValidationResult after repair
-        """
-        logger.info("Starting storage repair operation")
-        
-        # First validate to identify issues
-        validation_result = await self.validate_storage_integrity()
-        
-        if not auto_repair:
-            return validation_result
-        
-        repairs_made = 0
-        
-        try:
-            # Remove orphaned files if requested
-            if remove_orphaned and validation_result.orphaned_files:
-                for orphaned_path_str in validation_result.orphaned_files:
-                    orphaned_path = Path(orphaned_path_str)
-                    if orphaned_path.exists():
-                        try:
-                            if orphaned_path.is_dir():
-                                await asyncio.get_event_loop().run_in_executor(
-                                    None, shutil.rmtree, orphaned_path
-                                )
-                            else:
-                                orphaned_path.unlink()
-                            repairs_made += 1
-                            logger.info(f"Removed orphaned file: {orphaned_path}")
-                        except Exception as e:
-                            logger.error(f"Failed to remove orphaned file {orphaned_path}: {e}")
-            
-            # Remove corrupted entries from index
-            index = await self._get_index()
-            for snapshot_id in validation_result.corrupted_snapshots:
-                if snapshot_id in index.entries:
-                    index.remove_entry(snapshot_id)
-                    repairs_made += 1
-                    logger.info(f"Removed corrupted snapshot from index: {snapshot_id}")
-            
-            # Rebuild indexes if inconsistent
-            if not validation_result.index_valid:
-                await self._rebuild_indexes()
-                repairs_made += 1
-                logger.info("Rebuilt storage indexes")
-            
-            # Save repaired index
-            if repairs_made > 0:
-                await self._save_index()
-                logger.info(f"Storage repair completed: {repairs_made} issues fixed")
-            
-        except Exception as e:
-            logger.error(f"Storage repair failed: {e}")
-            raise StorageError(f"Storage repair failed: {str(e)}")
-        
-        # Validate again to confirm repairs
-        return await self.validate_storage_integrity()
+            raise StorageError(f"Deletion failed: {str(e)}")
     
     async def get_branch_ancestry(self, branch: str) -> Optional[BranchAncestry]:
         """
@@ -591,155 +447,245 @@ class StorageBackend:
         Returns:
             BranchAncestry if found, None otherwise
         """
-        index = await self._get_index()
-        return index.ancestry.get(branch)
+        await self._ensure_index_initialized()
+        
+        try:
+            def _query_ancestry():
+                with sqlite3.connect(self.index_db_path) as conn:
+                    conn.row_factory = sqlite3.Row
+                    cursor = conn.execute(
+                        "SELECT * FROM branch_ancestry WHERE branch = ?",
+                        (branch,)
+                    )
+                    return cursor.fetchone()
+            
+            row = await asyncio.get_event_loop().run_in_executor(None, _query_ancestry)
+            
+            if not row:
+                return None
+            
+            return BranchAncestry(
+                branch=row["branch"],
+                parent_branch=row["parent_branch"],
+                ancestor_snapshots=json.loads(row["ancestor_snapshots"]) if row["ancestor_snapshots"] else [],
+                snapshots=json.loads(row["snapshots"]) if row["snapshots"] else [],
+                created_at=datetime.fromisoformat(row["created_at"]),
+                updated_at=datetime.fromisoformat(row["updated_at"])
+            )
+            
+        except Exception as e:
+            logger.error(f"Failed to get branch ancestry for {branch}: {e}")
+            return None
     
-    async def get_fallback_chain(self, branch: str) -> List[str]:
+    async def get_fallback_chain(self, branch: str) -> List[StorageEntry]:
         """
-        Get fallback chain for branch (from branch to root).
+        Get fallback chain for branch (including ancestors).
         
         Args:
             branch: Branch name
             
         Returns:
-            List of branch names in fallback order
+            List of snapshots in fallback order
         """
-        index = await self._get_index()
-        chain = []
-        current_branch = branch
-        
-        # Build chain by following parent relationships
-        visited = set()
-        while current_branch and current_branch not in visited:
-            chain.append(current_branch)
-            visited.add(current_branch)
-            
-            ancestry = index.ancestry.get(current_branch)
-            if ancestry and ancestry.parent_branch:
-                current_branch = ancestry.parent_branch
-            else:
-                break
-        
-        return chain
-    
-    async def compact_storage(self) -> Dict[str, int]:
-        """
-        Compact storage by rebuilding indexes and cleaning up metadata.
-        
-        Returns:
-            Dictionary with compaction statistics
-        """
-        logger.info("Starting storage compaction")
-        
-        start_time = datetime.utcnow()
-        
-        # Rebuild indexes from filesystem
-        await self._rebuild_indexes()
-        
-        # Vacuum SQLite database if it exists
-        vacuum_count = 0
-        if self.index_path.exists():
-            try:
-                await self._vacuum_index_database()
-                vacuum_count = 1
-            except Exception as e:
-                logger.warning(f"Failed to vacuum index database: {e}")
-        
-        # Clean up temporary files
-        temp_cleaned = 0
-        if self.temp_path.exists():
-            temp_cleaned = await self._cleanup_temp_directory()
-        
-        duration = (datetime.utcnow() - start_time).total_seconds()
-        
-        stats = {
-            "indexes_rebuilt": 1,
-            "database_vacuumed": vacuum_count,
-            "temp_files_cleaned": temp_cleaned,
-            "duration_seconds": duration
-        }
-        
-        logger.info(f"Storage compaction completed: {stats}")
-        return stats
-    
-    # Private methods
-    
-    async def _get_index(self) -> StorageIndex:
-        """Get storage index, loading from disk if necessary."""
-        if self._index is None:
-            async with self._index_lock:
-                if self._index is None:
-                    await self._load_index()
-        return self._index
-    
-    async def _load_index(self) -> None:
-        """Load storage index from disk."""
-        index_file = self.metadata_path / "index.json"
-        
-        if index_file.exists():
-            try:
-                content = await self._read_file_async(index_file)
-                index_data = json.loads(content.decode())
-                self._index = StorageIndex(**index_data)
-                logger.debug(f"Loaded storage index with {len(self._index.entries)} entries")
-            except Exception as e:
-                logger.warning(f"Failed to load storage index: {e}")
-                self._index = StorageIndex()
-        else:
-            self._index = StorageIndex()
-            logger.debug("Created new storage index")
-    
-    async def _save_index(self) -> None:
-        """Save storage index to disk."""
-        if self._index is None:
-            return
-        
-        index_file = self.metadata_path / "index.json"
-        
         try:
-            # Create atomic backup
-            async with self.atomic_manager.atomic_operation(
-                target_path=index_file,
-                backup_existing=True,
-                cleanup_on_success=True
-            ) as atomic_ctx:
+            fallback_chain = []
+            current_branch = branch
+            visited_branches = set()
+            
+            while current_branch and current_branch not in visited_branches:
+                visited_branches.add(current_branch)
                 
-                temp_file = await self.atomic_manager.get_temp_file_path(
-                    atomic_ctx, "index.json"
+                # Get snapshots for current branch
+                branch_snapshots = await self.list_snapshots(
+                    branch=current_branch,
+                    status=StorageEntryStatus.ACTIVE
                 )
                 
-                # Serialize index
-                index_data = self._index.dict()
-                content = json.dumps(index_data, indent=2, default=str)
+                # Add latest snapshot from this branch
+                if branch_snapshots:
+                    latest_snapshot = sorted(branch_snapshots, key=lambda s: s.created_at, reverse=True)[0]
+                    fallback_chain.append(latest_snapshot)
                 
-                await self._write_file_async(temp_file, content.encode())
-                
-                logger.debug("Saved storage index")
-                
+                # Get parent branch
+                ancestry = await self.get_branch_ancestry(current_branch)
+                current_branch = ancestry.parent_branch if ancestry else None
+            
+            return fallback_chain
+            
         except Exception as e:
-            logger.error(f"Failed to save storage index: {e}")
-            raise StorageError(f"Failed to save storage index: {str(e)}")
+            logger.error(f"Failed to get fallback chain for {branch}: {e}")
+            raise StorageError(f"Failed to get fallback chain: {str(e)}")
     
-    async def _add_to_index(self, entry: StorageEntry) -> None:
-        """Add entry to storage index."""
-        index = await self._get_index()
-        index.add_entry(entry)
-        await self._save_index()
+    async def validate_storage(self, snapshot_id: str) -> bool:
+        """
+        Validate storage integrity for snapshot.
+        
+        Args:
+            snapshot_id: Snapshot identifier
+            
+        Returns:
+            True if valid, False otherwise
+        """
+        try:
+            storage_entry = await self.retrieve_snapshot(snapshot_id, update_access_time=False)
+            if not storage_entry:
+                return False
+            
+            # Check if path exists
+            if not storage_entry.path.exists():
+                return False
+            
+            # Verify checksum
+            current_checksum = await self._calculate_directory_checksum(storage_entry.path)
+            if current_checksum != storage_entry.checksum:
+                logger.warning(f"Checksum mismatch for {snapshot_id}")
+                return False
+            
+            # Verify metadata file exists and is valid
+            metadata_file = storage_entry.path / "metadata.json"
+            if not metadata_file.exists():
+                return False
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to validate storage for {snapshot_id}: {e}")
+            return False
     
-    async def _remove_from_index(self, snapshot_id: str) -> Optional[StorageEntry]:
-        """Remove entry from storage index."""
-        index = await self._get_index()
-        removed_entry = index.remove_entry(snapshot_id)
-        if removed_entry:
-            await self._save_index()
-        return removed_entry
+    async def get_storage_stats(self) -> StorageStats:
+        """
+        Get comprehensive storage statistics.
+        
+        Returns:
+            StorageStats with current statistics
+        """
+        await self._ensure_index_initialized()
+        
+        try:
+            def _get_stats():
+                with sqlite3.connect(self.index_db_path) as conn:
+                    conn.row_factory = sqlite3.Row
+                    
+                    # Get basic counts and sizes
+                    cursor = conn.execute("""
+                        SELECT 
+                            COUNT(*) as total_snapshots,
+                            SUM(size_bytes) as total_size,
+                            SUM(compressed_size_bytes) as total_compressed,
+                            AVG(compression_ratio) as avg_compression_ratio,
+                            COUNT(DISTINCT branch) as unique_branches
+                        FROM snapshots 
+                        WHERE status = 'active'
+                    """)
+                    basic_stats = cursor.fetchone()
+                    
+                    # Get branches
+                    cursor = conn.execute("SELECT DISTINCT branch FROM snapshots WHERE status = 'active'")
+                    branches = [row["branch"] for row in cursor.fetchall()]
+                    
+                    return basic_stats, branches
+            
+            basic_stats, branches = await asyncio.get_event_loop().run_in_executor(None, _get_stats)
+            
+            # Calculate additional statistics
+            total_disk_usage = await self._calculate_disk_usage()
+            free_space = await self._get_free_space()
+            
+            return StorageStats(
+                total_snapshots=basic_stats["total_snapshots"] or 0,
+                total_size_bytes=basic_stats["total_size"] or 0,
+                total_compressed_bytes=basic_stats["total_compressed"] or 0,
+                compression_savings_bytes=(basic_stats["total_size"] or 0) - (basic_stats["total_compressed"] or 0),
+                average_compression_ratio=basic_stats["avg_compression_ratio"] or 1.0,
+                storage_usage_bytes=total_disk_usage,
+                free_space_bytes=free_space,
+                branches=branches,
+                oldest_snapshot=await self._get_oldest_snapshot_date(),
+                newest_snapshot=await self._get_newest_snapshot_date()
+            )
+            
+        except Exception as e:
+            logger.error(f"Failed to get storage stats: {e}")
+            raise StorageError(f"Failed to get storage stats: {str(e)}")
     
-    async def _update_index_entry(self, entry: StorageEntry) -> None:
-        """Update existing index entry."""
-        index = await self._get_index()
-        index.entries[entry.snapshot_id] = entry
-        index.last_updated = datetime.utcnow()
-        await self._save_index()
+    # Private helper methods
+    
+    async def _copy_snapshot_files(self, source: Path, destination: Path) -> None:
+        """Copy snapshot files from source to destination."""
+        def _copy_sync():
+            destination.mkdir(parents=True, exist_ok=True)
+            for item in source.iterdir():
+                if item.is_file():
+                    shutil.copy2(item, destination / item.name)
+                elif item.is_dir():
+                    shutil.copytree(item, destination / item.name)
+        
+        await asyncio.get_event_loop().run_in_executor(None, _copy_sync)
+    
+    async def _store_snapshot_metadata(
+        self,
+        storage_entry: StorageEntry,
+        snapshot_metadata: SnapshotMetadata,
+        snapshot_path: Path
+    ) -> None:
+        """Store snapshot metadata in snapshot directory."""
+        metadata_file = snapshot_path / "metadata.json"
+        
+        # Combine storage entry and snapshot metadata
+        combined_metadata = {
+            "storage_entry": storage_entry.dict(),
+            "snapshot_metadata": snapshot_metadata.dict()
+        }
+        
+        def _write_metadata():
+            with open(metadata_file, 'w') as f:
+                json.dump(combined_metadata, f, indent=2, default=str)
+        
+        await asyncio.get_event_loop().run_in_executor(None, _write_metadata)
+    
+    async def _atomic_move(self, source: Path, destination: Path) -> None:
+        """Atomically move directory from source to destination."""
+        def _move_sync():
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(source), str(destination))
+        
+        await asyncio.get_event_loop().run_in_executor(None, _move_sync)
+    
+    async def _update_index(self, storage_entry: StorageEntry) -> None:
+        """Update SQLite index with storage entry."""
+        def _update_sync():
+            with sqlite3.connect(self.index_db_path) as conn:
+                conn.execute("""
+                    INSERT OR REPLACE INTO snapshots (
+                        snapshot_id, name, branch, parent_branch, path,
+                        size_bytes, compressed_size_bytes, checksum,
+                        created_at, last_accessed, database_type, database_version,
+                        compression_type, compression_ratio, git_commit, git_author,
+                        status, tags, description
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    storage_entry.snapshot_id,
+                    storage_entry.name,
+                    storage_entry.branch,
+                    storage_entry.parent_branch,
+                    str(storage_entry.path),
+                    storage_entry.size_bytes,
+                    storage_entry.compressed_size_bytes,
+                    storage_entry.checksum,
+                    storage_entry.created_at.isoformat(),
+                    storage_entry.last_accessed.isoformat() if storage_entry.last_accessed else None,
+                    storage_entry.database_type,
+                    storage_entry.database_version,
+                    storage_entry.compression_type,
+                    storage_entry.compression_ratio,
+                    storage_entry.git_commit,
+                    storage_entry.git_author,
+                    storage_entry.status.value,
+                    json.dumps(storage_entry.tags) if storage_entry.tags else None,
+                    storage_entry.description
+                ))
+        
+        await asyncio.get_event_loop().run_in_executor(None, _update_sync)
     
     async def _update_branch_ancestry(
         self,
@@ -747,166 +693,160 @@ class StorageBackend:
         parent_branch: Optional[str],
         snapshot_id: str
     ) -> None:
-        """Update branch ancestry information."""
-        index = await self._get_index()
-        
-        # Get or create branch ancestry
-        ancestry = index.ancestry.get(branch)
-        if ancestry is None:
-            ancestry = BranchAncestry(
-                branch_name=branch,
-                parent_branch=parent_branch,
-                created_at=datetime.utcnow()
-            )
-        
-        # Update ancestry information
-        ancestry.latest_snapshot = snapshot_id
-        ancestry.last_updated = datetime.utcnow()
-        ancestry.snapshot_count += 1
-        
-        if ancestry.oldest_snapshot is None:
-            ancestry.oldest_snapshot = snapshot_id
-        
-        index.ancestry[branch] = ancestry
-        await self._save_index()
-    
-    async def _update_ancestry_after_deletion(self, deleted_entry: StorageEntry) -> None:
-        """Update ancestry information after snapshot deletion."""
-        index = await self._get_index()
-        ancestry = index.ancestry.get(deleted_entry.branch)
-        
-        if ancestry:
-            ancestry.snapshot_count = max(0, ancestry.snapshot_count - 1)
-            
-            # If this was the latest snapshot, find new latest
-            if ancestry.latest_snapshot == deleted_entry.snapshot_id:
-                branch_snapshots = index.get_snapshots_by_branch(deleted_entry.branch)
-                if branch_snapshots:
-                    latest = max(branch_snapshots, key=lambda s: s.created_at)
-                    ancestry.latest_snapshot = latest.snapshot_id
-                else:
-                    ancestry.latest_snapshot = None
-            
-            # If this was the oldest snapshot, find new oldest
-            if ancestry.oldest_snapshot == deleted_entry.snapshot_id:
-                branch_snapshots = index.get_snapshots_by_branch(deleted_entry.branch)
-                if branch_snapshots:
-                    oldest = min(branch_snapshots, key=lambda s: s.created_at)
-                    ancestry.oldest_snapshot = oldest.snapshot_id
-                else:
-                    ancestry.oldest_snapshot = None
-            
-            ancestry.last_updated = datetime.utcnow()
-            
-            # Remove ancestry if no snapshots remain
-            if ancestry.snapshot_count == 0:
-                del index.ancestry[deleted_entry.branch]
-            
-            await self._save_index()
-    
-    async def _rebuild_indexes(self) -> None:
-        """Rebuild all indexes from filesystem."""
-        logger.info("Rebuilding storage indexes from filesystem")
-        
-        new_index = StorageIndex()
-        
-        # Scan filesystem for snapshots
-        if self.snapshots_path.exists():
-            for branch_dir in self.snapshots_path.iterdir():
-                if not branch_dir.is_dir():
-                    continue
-                
-                branch_name = branch_dir.name
-                
-                for snapshot_dir in branch_dir.iterdir():
-                    if not snapshot_dir.is_dir():
-                        continue
-                    
-                    try:
-                        # Load snapshot metadata
-                        metadata_file = snapshot_dir / "metadata.json"
-                        if not metadata_file.exists():
-                            logger.warning(f"Skipping snapshot without metadata: {snapshot_dir}")
-                            continue
-                        
-                        content = await self._read_file_async(metadata_file)
-                        metadata_dict = json.loads(content.decode())
-                        
-                        # Create storage entry from metadata
-                        snapshot_id = str(uuid.uuid4())  # Generate new ID
-                        
-                        # Calculate current metrics
-                        total_size = await self._calculate_directory_size(snapshot_dir)
-                        checksum = await self._calculate_directory_checksum(snapshot_dir)
-                        
-                        entry = StorageEntry(
-                            snapshot_id=snapshot_id,
-                            name=metadata_dict.get("name", snapshot_dir.name),
-                            branch=branch_name,
-                            path=snapshot_dir,
-                            size_bytes=total_size,
-                            compressed_size_bytes=metadata_dict.get("total_size_bytes", total_size),
-                            checksum=checksum,
-                            created_at=datetime.fromisoformat(
-                                metadata_dict.get("created_at", datetime.utcnow().isoformat())
-                            ),
-                            status=StorageEntryStatus.ACTIVE,
-                            tags=metadata_dict.get("tags", []),
-                            description=metadata_dict.get("description"),
-                            database_type=metadata_dict.get("database", {}).get("type", "unknown"),
-                            database_version=metadata_dict.get("database", {}).get("version", "unknown"),
-                            compression_type=metadata_dict.get("compression", "gzip"),
-                            compression_ratio=metadata_dict.get("compression_ratio", 1.0)
-                        )
-                        
-                        new_index.add_entry(entry)
-                        
-                    except Exception as e:
-                        logger.error(f"Failed to rebuild index entry for {snapshot_dir}: {e}")
-        
-        # Replace current index
-        self._index = new_index
-        await self._save_index()
-        
-        logger.info(f"Index rebuild completed: {len(new_index.entries)} entries")
-    
-    async def _cleanup_temp_directory(self) -> int:
-        """Clean up temporary directory and return number of files cleaned."""
-        cleaned_count = 0
-        
-        if not self.temp_path.exists():
-            return cleaned_count
-        
+        """Update branch ancestry tracking."""
         try:
-            for item in self.temp_path.iterdir():
-                try:
-                    if item.is_dir():
-                        await asyncio.get_event_loop().run_in_executor(
-                            None, shutil.rmtree, item
-                        )
+            def _update_ancestry():
+                with sqlite3.connect(self.index_db_path) as conn:
+                    conn.row_factory = sqlite3.Row
+                    
+                    # Get existing ancestry
+                    cursor = conn.execute(
+                        "SELECT * FROM branch_ancestry WHERE branch = ?",
+                        (branch,)
+                    )
+                    existing = cursor.fetchone()
+                    
+                    if existing:
+                        # Update existing ancestry
+                        snapshots = json.loads(existing["snapshots"]) if existing["snapshots"] else []
+                        if snapshot_id not in snapshots:
+                            snapshots.append(snapshot_id)
+                        
+                        ancestor_snapshots = json.loads(existing["ancestor_snapshots"]) if existing["ancestor_snapshots"] else []
+                        
+                        # Update parent branch if provided
+                        if parent_branch:
+                            # Get parent's snapshots to add to ancestors
+                            parent_cursor = conn.execute(
+                                "SELECT snapshots FROM branch_ancestry WHERE branch = ?",
+                                (parent_branch,)
+                            )
+                            parent_row = parent_cursor.fetchone()
+                            if parent_row and parent_row["snapshots"]:
+                                parent_snapshots = json.loads(parent_row["snapshots"])
+                                for parent_snapshot in parent_snapshots:
+                                    if parent_snapshot not in ancestor_snapshots:
+                                        ancestor_snapshots.append(parent_snapshot)
+                        
+                        conn.execute("""
+                            UPDATE branch_ancestry 
+                            SET parent_branch = ?, ancestor_snapshots = ?, snapshots = ?, updated_at = ?
+                            WHERE branch = ?
+                        """, (
+                            parent_branch,
+                            json.dumps(ancestor_snapshots),
+                            json.dumps(snapshots),
+                            datetime.utcnow().isoformat(),
+                            branch
+                        ))
                     else:
-                        item.unlink()
-                    cleaned_count += 1
-                except Exception as e:
-                    logger.warning(f"Failed to clean up temp item {item}: {e}")
-        
+                        # Create new ancestry
+                        ancestor_snapshots = []
+                        if parent_branch:
+                            # Get parent's snapshots
+                            parent_cursor = conn.execute(
+                                "SELECT snapshots FROM branch_ancestry WHERE branch = ?",
+                                (parent_branch,)
+                            )
+                            parent_row = parent_cursor.fetchone()
+                            if parent_row and parent_row["snapshots"]:
+                                ancestor_snapshots = json.loads(parent_row["snapshots"])
+                        
+                        conn.execute("""
+                            INSERT INTO branch_ancestry (
+                                branch, parent_branch, ancestor_snapshots, snapshots, created_at, updated_at
+                            ) VALUES (?, ?, ?, ?, ?, ?)
+                        """, (
+                            branch,
+                            parent_branch,
+                            json.dumps(ancestor_snapshots),
+                            json.dumps([snapshot_id]),
+                            datetime.utcnow().isoformat(),
+                            datetime.utcnow().isoformat()
+                        ))
+            
+            await asyncio.get_event_loop().run_in_executor(None, _update_ancestry)
+            
         except Exception as e:
-            logger.error(f"Failed to clean up temp directory: {e}")
-        
-        return cleaned_count
+            logger.error(f"Failed to update branch ancestry: {e}")
+            # Don't raise exception for ancestry tracking failures
     
-    async def _vacuum_index_database(self) -> None:
-        """Vacuum SQLite index database if it exists."""
-        # This would vacuum the SQLite database
-        # For now, this is a placeholder since we're using JSON
-        pass
-    
-    async def _copy_directory_async(self, source: Path, destination: Path) -> None:
-        """Copy directory asynchronously."""
-        def _copy_sync():
-            shutil.copytree(source, destination, dirs_exist_ok=True)
+    async def _remove_from_index(self, snapshot_id: str) -> None:
+        """Remove snapshot from index."""
+        def _remove_sync():
+            with sqlite3.connect(self.index_db_path) as conn:
+                conn.execute("DELETE FROM snapshots WHERE snapshot_id = ?", (snapshot_id,))
         
-        await asyncio.get_event_loop().run_in_executor(None, _copy_sync)
+        await asyncio.get_event_loop().run_in_executor(None, _remove_sync)
+    
+    async def _remove_from_branch_ancestry(self, branch: str, snapshot_id: str) -> None:
+        """Remove snapshot from branch ancestry."""
+        def _remove_sync():
+            with sqlite3.connect(self.index_db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.execute(
+                    "SELECT snapshots FROM branch_ancestry WHERE branch = ?",
+                    (branch,)
+                )
+                row = cursor.fetchone()
+                
+                if row and row["snapshots"]:
+                    snapshots = json.loads(row["snapshots"])
+                    if snapshot_id in snapshots:
+                        snapshots.remove(snapshot_id)
+                        
+                        conn.execute("""
+                            UPDATE branch_ancestry 
+                            SET snapshots = ?, updated_at = ?
+                            WHERE branch = ?
+                        """, (
+                            json.dumps(snapshots),
+                            datetime.utcnow().isoformat(),
+                            branch
+                        ))
+        
+        await asyncio.get_event_loop().run_in_executor(None, _remove_sync)
+    
+    async def _update_access_time(self, snapshot_id: str) -> None:
+        """Update last accessed time for snapshot."""
+        def _update_sync():
+            with sqlite3.connect(self.index_db_path) as conn:
+                conn.execute(
+                    "UPDATE snapshots SET last_accessed = ? WHERE snapshot_id = ?",
+                    (datetime.utcnow().isoformat(), snapshot_id)
+                )
+        
+        await asyncio.get_event_loop().run_in_executor(None, _update_sync)
+    
+    async def _remove_directory_async(self, path: Path) -> None:
+        """Remove directory asynchronously."""
+        def _remove_sync():
+            if path.exists():
+                shutil.rmtree(path)
+        
+        await asyncio.get_event_loop().run_in_executor(None, _remove_sync)
+    
+    async def _calculate_directory_checksum(self, directory: Path) -> str:
+        """Calculate checksum for directory contents."""
+        def _calc_checksum_sync():
+            hash_sha256 = hashlib.sha256()
+            
+            # Sort files for consistent checksum
+            files = sorted(directory.rglob("*"))
+            for file_path in files:
+                if file_path.is_file():
+                    # Include relative path in hash for structure verification
+                    rel_path = file_path.relative_to(directory)
+                    hash_sha256.update(str(rel_path).encode())
+                    
+                    # Include file content
+                    with open(file_path, 'rb') as f:
+                        for chunk in iter(lambda: f.read(8192), b""):
+                            hash_sha256.update(chunk)
+            
+            return hash_sha256.hexdigest()
+        
+        return await asyncio.get_event_loop().run_in_executor(None, _calc_checksum_sync)
     
     async def _calculate_directory_size(self, directory: Path) -> int:
         """Calculate total size of directory."""
@@ -919,62 +859,59 @@ class StorageBackend:
         
         return await asyncio.get_event_loop().run_in_executor(None, _calc_size_sync)
     
-    async def _calculate_directory_checksum(self, directory: Path) -> str:
-        """Calculate SHA256 checksum of directory contents."""
-        def _calc_checksum_sync():
-            hash_sha256 = hashlib.sha256()
-            
-            # Sort files for deterministic hashing
-            files = sorted(directory.rglob("*"))
-            
-            for file_path in files:
+    async def _calculate_disk_usage(self) -> int:
+        """Calculate total disk usage of storage."""
+        def _calc_usage_sync():
+            total_usage = 0
+            for file_path in self.project_path.rglob("*"):
                 if file_path.is_file():
-                    # Include file path in hash for structure integrity
-                    relative_path = file_path.relative_to(directory)
-                    hash_sha256.update(str(relative_path).encode())
-                    
-                    # Include file content
-                    with open(file_path, 'rb') as f:
-                        while chunk := f.read(8192):
-                            hash_sha256.update(chunk)
+                    total_usage += file_path.stat().st_size
+            return total_usage
+        
+        return await asyncio.get_event_loop().run_in_executor(None, _calc_usage_sync)
+    
+    async def _get_free_space(self) -> int:
+        """Get available free space."""
+        def _get_space_sync():
+            statvfs = os.statvfs(self.storage_config.path)
+            return statvfs.f_bavail * statvfs.f_frsize
+        
+        try:
+            return await asyncio.get_event_loop().run_in_executor(None, _get_space_sync)
+        except:
+            # Fallback if statvfs not available
+            return 1024 * 1024 * 1024  # 1GB fallback
+    
+    async def _get_oldest_snapshot_date(self) -> Optional[datetime]:
+        """Get creation date of oldest snapshot."""
+        try:
+            def _get_oldest():
+                with sqlite3.connect(self.index_db_path) as conn:
+                    cursor = conn.execute(
+                        "SELECT MIN(created_at) as oldest FROM snapshots WHERE status = 'active'"
+                    )
+                    row = cursor.fetchone()
+                    return row[0] if row and row[0] else None
             
-            return hash_sha256.hexdigest()
-        
-        return await asyncio.get_event_loop().run_in_executor(None, _calc_checksum_sync)
+            oldest_str = await asyncio.get_event_loop().run_in_executor(None, _get_oldest)
+            return datetime.fromisoformat(oldest_str) if oldest_str else None
+            
+        except Exception:
+            return None
     
-    def _parse_size_string(self, size_str: str) -> int:
-        """Parse size string (e.g., '10GB') to bytes."""
-        import re
-        
-        match = re.match(r'^(\d+(?:\.\d+)?)\s*([KMGT]?B)$', size_str.upper())
-        if not match:
-            raise ValueError(f"Invalid size format: {size_str}")
-        
-        number, unit = match.groups()
-        number = float(number)
-        
-        multipliers = {
-            'B': 1,
-            'KB': 1024,
-            'MB': 1024 ** 2,
-            'GB': 1024 ** 3,
-            'TB': 1024 ** 4,
-        }
-        
-        return int(number * multipliers[unit])
-    
-    async def _read_file_async(self, file_path: Path) -> bytes:
-        """Read file asynchronously."""
-        def _read_sync():
-            with open(file_path, 'rb') as f:
-                return f.read()
-        
-        return await asyncio.get_event_loop().run_in_executor(None, _read_sync)
-    
-    async def _write_file_async(self, file_path: Path, content: bytes) -> None:
-        """Write file asynchronously."""
-        def _write_sync():
-            with open(file_path, 'wb') as f:
-                f.write(content)
-        
-        await asyncio.get_event_loop().run_in_executor(None, _write_sync)
+    async def _get_newest_snapshot_date(self) -> Optional[datetime]:
+        """Get creation date of newest snapshot."""
+        try:
+            def _get_newest():
+                with sqlite3.connect(self.index_db_path) as conn:
+                    cursor = conn.execute(
+                        "SELECT MAX(created_at) as newest FROM snapshots WHERE status = 'active'"
+                    )
+                    row = cursor.fetchone()
+                    return row[0] if row and row[0] else None
+            
+            newest_str = await asyncio.get_event_loop().run_in_executor(None, _get_newest)
+            return datetime.fromisoformat(newest_str) if newest_str else None
+            
+        except Exception:
+            return None

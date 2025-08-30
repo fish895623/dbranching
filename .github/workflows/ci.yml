@@ -1,0 +1,221 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, develop, epic/* ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+        database: [sqlite, mysql, postgresql]
+        exclude:
+          # Only test all databases on Python 3.11 to reduce CI time
+          - python-version: "3.10"
+            database: mysql
+          - python-version: "3.10"
+            database: postgresql
+          - python-version: "3.12"
+            database: mysql
+          - python-version: "3.12"
+            database: postgresql
+
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: testpass
+          MYSQL_DATABASE: testdb
+          MYSQL_USER: testuser
+          MYSQL_PASSWORD: testpass
+        ports:
+          - 3306:3306
+        options: --health-cmd="mysqladmin ping" --health-interval=10s --health-timeout=5s --health-retries=3
+
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: testpass
+          POSTGRES_DB: testdb
+          POSTGRES_USER: testuser
+        ports:
+          - 5432:5432
+        options: --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Install Poetry
+      uses: snok/install-poetry@v1
+      with:
+        version: latest
+        virtualenvs-create: true
+        virtualenvs-in-project: true
+
+    - name: Load cached venv
+      id: cached-poetry-dependencies
+      uses: actions/cache@v3
+      with:
+        path: .venv
+        key: venv-${{ runner.os }}-${{ matrix.python-version }}-${{ hashFiles('**/poetry.lock') }}
+
+    - name: Install dependencies
+      if: steps.cached-poetry-dependencies.outputs.cache-hit != 'true'
+      run: poetry install --no-interaction --no-root
+
+    - name: Install package
+      run: poetry install --no-interaction
+
+    - name: Wait for MySQL
+      if: matrix.database == 'mysql'
+      run: |
+        until mysqladmin ping -h 127.0.0.1 -P 3306 -u root -ptestpass --silent; do
+          echo 'Waiting for MySQL...'
+          sleep 2
+        done
+
+    - name: Wait for PostgreSQL
+      if: matrix.database == 'postgresql'
+      run: |
+        until pg_isready -h localhost -p 5432 -U testuser; do
+          echo 'Waiting for PostgreSQL...'
+          sleep 2
+        done
+
+    - name: Run linting
+      run: |
+        poetry run flake8 src/ tests/
+        poetry run black --check src/ tests/
+        poetry run isort --check-only src/ tests/
+
+    - name: Run type checking
+      run: poetry run mypy src/dbranching
+
+    - name: Run unit tests
+      run: poetry run pytest tests/unit/ -v --cov=dbranching --cov-report=xml --cov-report=term-missing
+
+    - name: Run integration tests (SQLite)
+      if: matrix.database == 'sqlite'
+      run: poetry run pytest tests/integration/ -v -m "sqlite or not (mysql or postgresql)" --maxfail=5
+
+    - name: Run integration tests (MySQL)
+      if: matrix.database == 'mysql'
+      run: poetry run pytest tests/integration/ -v -m "mysql or not (sqlite or postgresql)" --maxfail=5
+
+    - name: Run integration tests (PostgreSQL)
+      if: matrix.database == 'postgresql'
+      run: poetry run pytest tests/integration/ -v -m "postgresql or not (sqlite or mysql)" --maxfail=5
+
+    - name: Upload coverage to Codecov
+      if: matrix.python-version == '3.11' && matrix.database == 'sqlite'
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./coverage.xml
+        flags: unittests
+        name: codecov-umbrella
+
+  performance:
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python 3.11
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.11"
+
+    - name: Install Poetry
+      uses: snok/install-poetry@v1
+      with:
+        version: latest
+        virtualenvs-create: true
+        virtualenvs-in-project: true
+
+    - name: Install dependencies
+      run: poetry install --no-interaction
+
+    - name: Run performance tests
+      run: poetry run pytest tests/performance/ -v --benchmark-json=benchmark_results.json
+
+    - name: Store benchmark result
+      uses: benchmark-action/github-action-benchmark@v1
+      with:
+        name: DBranching Benchmark
+        tool: 'pytest'
+        output-file-path: benchmark_results.json
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        auto-push: true
+
+  security:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python 3.11
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.11"
+
+    - name: Install Poetry
+      uses: snok/install-poetry@v1
+      with:
+        version: latest
+        virtualenvs-create: true
+        virtualenvs-in-project: true
+
+    - name: Install dependencies
+      run: poetry install --no-interaction
+
+    - name: Run security checks
+      run: |
+        poetry run bandit -r src/ -f json -o bandit-report.json
+        poetry run safety check --json --output safety-report.json || true
+
+    - name: Upload security reports
+      uses: actions/upload-artifact@v3
+      with:
+        name: security-reports
+        path: |
+          bandit-report.json
+          safety-report.json
+
+  build:
+    runs-on: ubuntu-latest
+    needs: [test, security]
+    
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python 3.11
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.11"
+
+    - name: Install Poetry
+      uses: snok/install-poetry@v1
+      with:
+        version: latest
+        virtualenvs-create: true
+        virtualenvs-in-project: true
+
+    - name: Build package
+      run: poetry build
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: dist
+        path: dist/

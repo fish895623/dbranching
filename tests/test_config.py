@@ -24,24 +24,24 @@ class TestDatabaseConfig:
     def test_default_config(self) -> None:
         """Test default database configuration."""
         config = DatabaseConfig()
-        assert config.type == "postgresql"
+        assert config.driver == "postgresql"
         assert config.host == "localhost"
         assert config.port == 5432
         assert config.database == "myapp"
-        assert config.username == "user"
-        assert config.password_env == "DB_PASSWORD"
+        assert config.username is None  # Changed to optional
+        assert config.password is None  # Changed from password_env
 
     def test_custom_config(self) -> None:
         """Test custom database configuration."""
         config = DatabaseConfig(
-            type="mysql",
+            driver="mysql",
             host="db.example.com",
             port=3306,
             database="myapp",
             username="myuser",
-            password_env="MYSQL_PASSWORD",
+            password="secret",
         )
-        assert config.type == "mysql"
+        assert config.driver == "mysql"
         assert config.host == "db.example.com"
         assert config.port == 3306
 
@@ -56,7 +56,7 @@ class TestDatabaseConfig:
     def test_invalid_database_type(self) -> None:
         """Test validation of invalid database type."""
         with pytest.raises(ValueError, match="Input should be"):
-            DatabaseConfig(type="oracle")
+            DatabaseConfig(driver="oracle")
 
 
 class TestStorageConfig:
@@ -65,25 +65,25 @@ class TestStorageConfig:
     def test_default_config(self) -> None:
         """Test default storage configuration."""
         config = StorageConfig()
-        assert config.directory == Path.home() / ".dbranching" / "snapshots"
-        assert config.compression == "gzip"
-        assert config.retention_days == 30
+        assert config.path == Path.home() / ".dbranching" / "snapshots"
+        assert config.compression.algorithm == "gzip"  # Now a nested object
+        assert config.retention.max_age == "30d"  # Changed structure
 
     def test_custom_directory(self) -> None:
         """Test custom storage directory."""
-        config = StorageConfig(directory="/tmp/snapshots")
-        assert config.directory == Path("/tmp/snapshots")
+        config = StorageConfig(path="/tmp/snapshots")
+        assert config.path == Path("/tmp/snapshots")
 
     def test_home_directory_expansion(self) -> None:
         """Test home directory expansion."""
-        config = StorageConfig(directory="~/custom/snapshots")
+        config = StorageConfig(path="~/custom/snapshots")
         expected = Path.home() / "custom" / "snapshots"
-        assert config.directory == expected
+        assert config.path == expected
 
     def test_invalid_retention_days(self) -> None:
         """Test validation of negative retention days."""
-        with pytest.raises(ValueError, match="Retention days must be non-negative"):
-            StorageConfig(retention_days=-1)
+        with pytest.raises(ValueError, match="max_count must be non-negative"):
+            StorageConfig(retention={"max_count": -1})
 
 
 class TestLoggingConfig:
@@ -119,21 +119,27 @@ class TestConfig:
     def test_default_config(self) -> None:
         """Test default configuration."""
         config = Config()
-        assert isinstance(config.database, DatabaseConfig)
+        assert isinstance(config.databases["default"], DatabaseConfig)
         assert isinstance(config.storage, StorageConfig)
         assert isinstance(config.logging, LoggingConfig)
 
     def test_custom_config(self) -> None:
         """Test custom configuration."""
         config_data = {
-            "database": {
-                "type": "mysql",
-                "database": "myapp",
-                "username": "myuser",
+            "databases": {
+                "default": {
+                    "driver": "mysql",
+                    "database": "myapp",
+                    "username": "myuser",
+                }
             },
             "storage": {
-                "compression": "bzip2",
-                "retention_days": 7,
+                "compression": {
+                    "algorithm": "bzip2"
+                },
+                "retention": {
+                    "max_age": "7d"
+                },
             },
             "logging": {
                 "level": "DEBUG",
@@ -141,15 +147,17 @@ class TestConfig:
             },
         }
         config = Config(**config_data)
-        assert config.database.type == "mysql"
-        assert config.storage.compression == "bzip2"
+        assert config.databases["default"].driver == "mysql"
+        assert config.storage.compression.algorithm == "bzip2"
         assert config.logging.level == "DEBUG"
 
     def test_validation_error(self) -> None:
         """Test configuration validation error."""
         config_data = {
-            "database": {
-                "type": "invalid",
+            "databases": {
+                "default": {
+                    "driver": "invalid",
+                }
             }
         }
         with pytest.raises(ValueError):
@@ -178,20 +186,24 @@ class TestConfigManager:
         config = manager.load_config()
 
         assert isinstance(config, Config)
-        assert config.database.type == "postgresql"
-        assert config.storage.compression == "gzip"
+        assert config.databases["default"].driver == "postgresql"
+        assert config.storage.compression.algorithm == "gzip"
 
     def test_load_yaml_config_file(self) -> None:
         """Test loading YAML configuration file."""
         config_data = {
-            "database": {
-                "type": "mysql",
-                "host": "db.example.com",
-                "database": "myapp",
-                "username": "myuser",
+            "databases": {
+                "default": {
+                    "driver": "mysql",
+                    "host": "db.example.com",
+                    "database": "myapp",
+                    "username": "myuser",
+                }
             },
             "storage": {
-                "compression": "bzip2",
+                "compression": {
+                    "algorithm": "bzip2"
+                },
             },
         }
 
@@ -203,19 +215,21 @@ class TestConfigManager:
             manager = ConfigManager(config_file=config_path)
             config = manager.load_config()
 
-            assert config.database.type == "mysql"
-            assert config.database.host == "db.example.com"
-            assert config.storage.compression == "bzip2"
+            assert config.databases["default"].driver == "mysql"
+            assert config.databases["default"].host == "db.example.com"
+            assert config.storage.compression.algorithm == "bzip2"
         finally:
             config_path.unlink()
 
     def test_load_json_config_file(self) -> None:
         """Test loading JSON configuration file."""
         config_data = {
-            "database": {
-                "type": "sqlite",
-                "database": "app.db",
-                "username": "user",
+            "databases": {
+                "default": {
+                    "driver": "sqlite",
+                    "database": "app.db",
+                    "username": "user",
+                }
             },
             "logging": {
                 "level": "DEBUG",
@@ -230,7 +244,7 @@ class TestConfigManager:
             manager = ConfigManager(config_file=config_path)
             config = manager.load_config()
 
-            assert config.database.type == "sqlite"
+            assert config.databases["default"].driver == "sqlite"
             assert config.logging.level == "DEBUG"
         finally:
             config_path.unlink()
@@ -304,13 +318,13 @@ class TestConfigManager:
     def test_environment_variable_overrides(self) -> None:
         """Test environment variable configuration overrides."""
         env_vars = {
-            "DBRANCHING_DATABASE_TYPE": "mysql",
-            "DBRANCHING_DATABASE_HOST": "env.example.com",
-            "DBRANCHING_DATABASE_PORT": "3306",
-            "DBRANCHING_DATABASE_NAME": "envdb",
-            "DBRANCHING_DATABASE_USERNAME": "envuser",
-            "DBRANCHING_STORAGE_COMPRESSION": "none",
-            "DBRANCHING_LOG_LEVEL": "DEBUG",
+            "DBRANCHING_DATABASES_DEFAULT_DRIVER": "mysql",
+            "DBRANCHING_DATABASES_DEFAULT_HOST": "env.example.com",
+            "DBRANCHING_DATABASES_DEFAULT_PORT": "3306",
+            "DBRANCHING_DATABASES_DEFAULT_DATABASE": "envdb",
+            "DBRANCHING_DATABASES_DEFAULT_USERNAME": "envuser",
+            "DBRANCHING_STORAGE_COMPRESSION_ALGORITHM": "none",
+            "DBRANCHING_LOGGING_LEVEL": "DEBUG",
         }
 
         # Set environment variables
@@ -323,12 +337,12 @@ class TestConfigManager:
             manager = ConfigManager()
             config = manager.load_config()
 
-            assert config.database.type == "mysql"
-            assert config.database.host == "env.example.com"
-            assert config.database.port == 3306
-            assert config.database.database == "envdb"
-            assert config.database.username == "envuser"
-            assert config.storage.compression == "none"
+            assert config.databases["default"].driver == "mysql"
+            assert config.databases["default"].host == "env.example.com"
+            assert config.databases["default"].port == 3306
+            assert config.databases["default"].database == "envdb"
+            assert config.databases["default"].username == "envuser"
+            assert config.storage.compression.algorithm == "none"
             assert config.logging.level == "DEBUG"
 
         finally:
@@ -341,20 +355,22 @@ class TestConfigManager:
 
     def test_invalid_env_numeric_value(self) -> None:
         """Test invalid numeric environment variable value."""
-        os.environ["DBRANCHING_DATABASE_PORT"] = "invalid"
+        os.environ["DBRANCHING_DATABASES_DEFAULT_PORT"] = "invalid"
 
         try:
             manager = ConfigManager()
             with pytest.raises(ConfigurationError, match="Invalid numeric value"):
                 manager.load_config()
         finally:
-            os.environ.pop("DBRANCHING_DATABASE_PORT", None)
+            os.environ.pop("DBRANCHING_DATABASES_DEFAULT_PORT", None)
 
     def test_config_validation_error(self) -> None:
         """Test configuration validation error."""
         config_data = {
-            "database": {
-                "type": "invalid_type",
+            "databases": {
+                "default": {
+                    "driver": "invalid_type",
+                }
             }
         }
 
@@ -436,7 +452,7 @@ class TestConfigManager:
             assert config_path.exists()
             content = config_path.read_text()
             config_data = json.loads(content)
-            assert "database" in config_data
+            assert "databases" in config_data  # Changed from 'database' to 'databases'
             assert "storage" in config_data
             assert "logging" in config_data
 
@@ -454,18 +470,18 @@ class TestConfigManager:
         manager = ConfigManager()
 
         base = {
-            "database": {"host": "localhost", "port": 5432},
-            "storage": {"compression": "gzip"},
+            "databases": {"default": {"host": "localhost", "port": 5432}},
+            "storage": {"compression": {"algorithm": "gzip"}},
         }
 
         override = {
-            "database": {"host": "remote.example.com"},
+            "databases": {"default": {"host": "remote.example.com"}},
             "logging": {"level": "DEBUG"},
         }
 
         result = manager._merge_configs(base, override)
 
-        assert result["database"]["host"] == "remote.example.com"  # overridden
-        assert result["database"]["port"] == 5432  # preserved
-        assert result["storage"]["compression"] == "gzip"  # preserved
+        assert result["databases"]["default"]["host"] == "remote.example.com"  # overridden
+        assert result["databases"]["default"]["port"] == 5432  # preserved
+        assert result["storage"]["compression"]["algorithm"] == "gzip"  # preserved
         assert result["logging"]["level"] == "DEBUG"  # added

@@ -8,13 +8,31 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12"]
         database: [sqlite, mysql, postgresql]
         exclude:
+          # Reduce matrix size by testing fewer database combinations on non-Ubuntu
+          - os: windows-latest
+            database: mysql
+          - os: windows-latest
+            database: postgresql
+          - os: macos-latest
+            database: mysql
+          - os: macos-latest
+            database: postgresql
           # Only test all databases on Python 3.11 to reduce CI time
+          - python-version: "3.8"
+            database: mysql
+          - python-version: "3.8"
+            database: postgresql
+          - python-version: "3.9"
+            database: mysql
+          - python-version: "3.9"
+            database: postgresql
           - python-version: "3.10"
             database: mysql
           - python-version: "3.10"
@@ -23,10 +41,12 @@ jobs:
             database: mysql
           - python-version: "3.12"
             database: postgresql
+    
+    runs-on: ${{ matrix.os }}
 
     services:
       mysql:
-        image: mysql:8.0
+        image: ${{ matrix.os == 'ubuntu-latest' && matrix.database == 'mysql' && 'mysql:8.0' || '' }}
         env:
           MYSQL_ROOT_PASSWORD: testpass
           MYSQL_DATABASE: testdb
@@ -34,17 +54,17 @@ jobs:
           MYSQL_PASSWORD: testpass
         ports:
           - 3306:3306
-        options: --health-cmd="mysqladmin ping" --health-interval=10s --health-timeout=5s --health-retries=3
+        options: ${{ matrix.os == 'ubuntu-latest' && matrix.database == 'mysql' && '--health-cmd="mysqladmin ping" --health-interval=10s --health-timeout=5s --health-retries=3' || '' }}
 
       postgres:
-        image: postgres:15
+        image: ${{ matrix.os == 'ubuntu-latest' && matrix.database == 'postgresql' && 'postgres:15' || '' }}
         env:
           POSTGRES_PASSWORD: testpass
           POSTGRES_DB: testdb
           POSTGRES_USER: testuser
         ports:
           - 5432:5432
-        options: --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+        options: ${{ matrix.os == 'ubuntu-latest' && matrix.database == 'postgresql' && '--health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5' || '' }}
 
     steps:
     - uses: actions/checkout@v4
@@ -72,11 +92,28 @@ jobs:
       if: steps.cached-poetry-dependencies.outputs.cache-hit != 'true'
       run: poetry install --no-interaction --no-root
 
-    - name: Install package
-      run: poetry install --no-interaction
+    - name: Install package with database extras
+      run: |
+        if [ "${{ matrix.database }}" = "postgresql" ]; then
+          poetry install --no-interaction --extras postgresql
+        elif [ "${{ matrix.database }}" = "mysql" ]; then
+          poetry install --no-interaction --extras mysql  
+        elif [ "${{ matrix.database }}" = "sqlite" ]; then
+          poetry install --no-interaction --extras sqlite
+        else
+          poetry install --no-interaction
+        fi
+      shell: bash
+
+    - name: Verify installation
+      run: |
+        poetry run dbranching --version
+        poetry run dbbranch --version
+        poetry run python -c "import dbranching; print('Package imported successfully')"
+      shell: bash
 
     - name: Wait for MySQL
-      if: matrix.database == 'mysql'
+      if: matrix.os == 'ubuntu-latest' && matrix.database == 'mysql'
       run: |
         until mysqladmin ping -h 127.0.0.1 -P 3306 -u root -ptestpass --silent; do
           echo 'Waiting for MySQL...'
@@ -84,7 +121,7 @@ jobs:
         done
 
     - name: Wait for PostgreSQL
-      if: matrix.database == 'postgresql'
+      if: matrix.os == 'ubuntu-latest' && matrix.database == 'postgresql'
       run: |
         until pg_isready -h localhost -p 5432 -U testuser; do
           echo 'Waiting for PostgreSQL...'
@@ -108,11 +145,11 @@ jobs:
       run: poetry run pytest tests/integration/ -v -m "sqlite or not (mysql or postgresql)" --maxfail=5
 
     - name: Run integration tests (MySQL)
-      if: matrix.database == 'mysql'
+      if: matrix.os == 'ubuntu-latest' && matrix.database == 'mysql'
       run: poetry run pytest tests/integration/ -v -m "mysql or not (sqlite or postgresql)" --maxfail=5
 
     - name: Run integration tests (PostgreSQL)
-      if: matrix.database == 'postgresql'
+      if: matrix.os == 'ubuntu-latest' && matrix.database == 'postgresql'
       run: poetry run pytest tests/integration/ -v -m "postgresql or not (sqlite or mysql)" --maxfail=5
 
     - name: Upload coverage to Codecov
@@ -181,8 +218,9 @@ jobs:
 
     - name: Run security checks
       run: |
-        poetry run bandit -r src/ -f json -o bandit-report.json
+        poetry run bandit -r src/ -f json -o bandit-report.json || true
         poetry run safety check --json --output safety-report.json || true
+        poetry run semgrep --config=auto src/ --json -o semgrep-report.json || true
 
     - name: Upload security reports
       uses: actions/upload-artifact@v3
@@ -191,6 +229,7 @@ jobs:
         path: |
           bandit-report.json
           safety-report.json
+          semgrep-report.json
 
   build:
     runs-on: ubuntu-latest

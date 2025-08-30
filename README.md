@@ -22,13 +22,54 @@ DBranching enables database versioning and snapshot management similar to Git br
 
 ### Installation
 
-```bash
-# Install via Poetry (recommended for development)
-poetry install
+#### From PyPI (Recommended)
 
-# Or install from source
-pip install -e .
+```bash
+# Basic installation (SQLite support only)
+pip install dbranching
+
+# With database extras
+pip install dbranching[postgresql]  # PostgreSQL support
+pip install dbranching[mysql]       # MySQL support  
+pip install dbranching[sqlite]      # SQLite support
+pip install dbranching[all-databases]  # All database drivers
+
+# Verify installation
+dbranching --version
+python -m dbranching.scripts.verify-installation
 ```
+
+#### From Source (Development)
+
+```bash
+# Clone repository
+git clone https://github.com/fish895623/dbranching.git
+cd dbranching
+
+# Install with Poetry (recommended for development)
+poetry install --extras all-databases
+
+# Or install with pip
+pip install -e .[all-databases]
+```
+
+#### Using Docker
+
+```bash
+# Run from Docker Hub
+docker run --rm fish895623/dbranching:latest --help
+
+# Development with Docker Compose
+docker-compose up dbranching
+```
+
+### System Requirements
+
+- **Python**: 3.8 or higher
+- **Operating Systems**: Linux, macOS, Windows
+- **Database Support**: PostgreSQL, MySQL, SQLite
+- **Memory**: Minimum 256MB RAM
+- **Storage**: Variable based on database snapshot sizes
 
 ### Initialize
 
@@ -407,6 +448,85 @@ To add support for a new database type:
 3. Implement database-specific operations (not yet implemented)
 4. Add tests for the new database type
 5. Update documentation
+
+## Installation Troubleshooting
+
+### Installation Issues
+
+#### Package Not Found
+```bash
+# Update pip
+pip install --upgrade pip
+
+# Use explicit PyPI index
+pip install -i https://pypi.org/simple/ dbranching
+```
+
+#### Permission Errors on macOS/Linux
+```bash
+# Install for current user only
+pip install --user dbranching
+
+# Or use virtual environment (recommended)
+python -m venv venv
+source venv/bin/activate  # Linux/macOS
+# or
+venv\Scripts\activate     # Windows
+pip install dbranching
+```
+
+#### Database Driver Issues
+```bash
+# Install specific database support
+pip install dbranching[postgresql]
+pip install dbranching[mysql]
+
+# Check installed extras
+pip show dbranching
+```
+
+#### Command Not Found (dbranching/dbbranch)
+```bash
+# Check Python scripts directory is in PATH
+python -m site --user-base
+# Add <user-base>/bin to your PATH
+
+# Or run as module
+python -m dbranching --help
+```
+
+#### Verification Script
+```bash
+# Run installation verification
+python -c "
+import subprocess
+import sys
+result = subprocess.run([sys.executable, '-m', 'dbranching.scripts.verify-installation'], 
+                       capture_output=True, text=True)
+print(result.stdout)
+if result.stderr: print(result.stderr)
+"
+```
+
+### Platform-Specific Issues
+
+#### Windows
+- **Error**: "'dbranching' is not recognized"
+  - **Solution**: Add Python Scripts directory to PATH or use `py -m dbranching`
+- **Error**: Microsoft Visual C++ required
+  - **Solution**: Install Microsoft C++ Build Tools or use pre-compiled wheels
+
+#### macOS
+- **Error**: Command not found after pip install
+  - **Solution**: Install with `--user` flag or use virtual environment
+- **Error**: Permission denied
+  - **Solution**: Don't use `sudo` with pip, use `--user` or virtual environment
+
+#### Linux
+- **Error**: Permission denied on system installation
+  - **Solution**: Use package manager or install with `--user` flag
+- **Error**: Missing development headers
+  - **Solution**: Install `python3-dev` package
 
 ## Troubleshooting
 

@@ -1,0 +1,82 @@
+version: '3.8'
+
+services:
+  dbranching:
+    build:
+      context: .
+      target: development
+    volumes:
+      - .:/app
+      - ~/.gitconfig:/home/dbranching/.gitconfig:ro
+    working_dir: /app
+    environment:
+      - DBRANCHING_CONFIG_FILE=/app/dbranching.yaml
+    depends_on:
+      - postgres
+      - mysql
+    networks:
+      - dbranching-net
+
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: testdb
+      POSTGRES_USER: testuser
+      POSTGRES_PASSWORD: testpass
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - dbranching-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U testuser -d testdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: testpass
+      MYSQL_DATABASE: testdb
+      MYSQL_USER: testuser
+      MYSQL_PASSWORD: testpass
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    networks:
+      - dbranching-net
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Test runner service
+  test:
+    build:
+      context: .
+      target: development
+    volumes:
+      - .:/app
+    working_dir: /app
+    environment:
+      - DBRANCHING_CONFIG_FILE=/app/test-config.yaml
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+    networks:
+      - dbranching-net
+    command: ["poetry", "run", "pytest", "-v"]
+
+volumes:
+  postgres_data:
+  mysql_data:
+
+networks:
+  dbranching-net:
+    driver: bridge

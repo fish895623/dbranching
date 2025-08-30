@@ -7,6 +7,7 @@ from typing import Optional
 
 import click
 
+from . import __version__
 from .config import Config, ConfigManager
 from .exceptions import DBranchingError, ConfigurationError, DatabaseConnectionError, StorageError
 
@@ -109,6 +110,7 @@ def handle_error(error: Exception, verbose: bool = False) -> None:
 
 
 @click.group(invoke_without_command=True)
+@click.version_option(version=__version__, prog_name="dbranching")
 @click.option(
     "--config-file",
     "-c",

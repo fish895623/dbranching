@@ -60,3 +60,23 @@ class StorageError(DBranchingError):
         if path:
             message = f"Storage error ({path}): {message}"
         super().__init__(message, exit_code=6)
+
+
+class DatabaseAdapterError(DBranchingError):
+    """Raised when database adapter operations fail."""
+
+    def __init__(self, message: str, adapter_type: Optional[str] = None) -> None:
+        self.adapter_type = adapter_type
+        if adapter_type:
+            message = f"Database adapter error ({adapter_type}): {message}"
+        super().__init__(message, exit_code=7)
+
+
+class DatabaseTimeoutError(DatabaseConnectionError):
+    """Raised when database operations timeout."""
+
+    def __init__(self, message: str, timeout_seconds: Optional[float] = None) -> None:
+        self.timeout_seconds = timeout_seconds
+        if timeout_seconds:
+            message = f"Database timeout after {timeout_seconds}s: {message}"
+        super().__init__(message)

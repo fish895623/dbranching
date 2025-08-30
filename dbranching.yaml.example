@@ -1,0 +1,20 @@
+# DBranching Configuration Example
+# Copy this file to dbranching.yaml and customize as needed
+
+database:
+  type: postgresql  # postgresql, mysql, or sqlite
+  host: localhost
+  port: 5432
+  database: myapp
+  username: user
+  password_env: DB_PASSWORD  # Environment variable containing password
+
+storage:
+  directory: ~/.dbranching/snapshots
+  compression: gzip  # none, gzip, bzip2, or lzma
+  retention_days: 30
+
+logging:
+  level: INFO  # DEBUG, INFO, WARNING, ERROR, or CRITICAL
+  format: structured  # structured, simple, or json
+  file: ~/.dbranching/logs/dbranching.log

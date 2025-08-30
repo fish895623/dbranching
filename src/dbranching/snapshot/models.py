@@ -155,7 +155,7 @@ class SnapshotMetadata(BaseModel):
         }
         
         import json
-        json_str = json.dumps(data, sort_keys=True, separators=(',', ':'))
+        json_str = json.dumps(data, sort_keys=True, separators=(',', ':'), default=str)
         return hashlib.sha256(json_str.encode()).hexdigest()
 
 

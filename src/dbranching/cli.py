@@ -1131,7 +1131,7 @@ def hook_uninstall(ctx: click.Context, confirm: bool) -> None:
     help="Show detailed status including file sizes and timestamps",
 )
 @click.pass_context
-def hook_status(ctx: click.Context, verbose_flag: bool) -> None:
+def hook_status(ctx: click.Context, verbose: bool) -> None:
     """Display Git hook installation and configuration status.
 
     Shows the current state of dbranching Git hooks including installation status,
@@ -1161,7 +1161,7 @@ def hook_status(ctx: click.Context, verbose_flag: bool) -> None:
     This command never modifies the repository and is safe to run at any time.
     """
     global_verbose = ctx.obj["verbose"]
-    show_verbose = verbose_flag or global_verbose
+    show_verbose = verbose or global_verbose
 
     try:
         config_obj = ctx.obj["config"]
